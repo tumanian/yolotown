@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Agent shim: substituted for the real claude CLI via CLAUDE_BIN in tests.
+# Behavior selected by FAKE_CLAUDE_MODE (good | bad | noop | crash).
+# Always records its full argv (one arg per line) to $FAKE_CLAUDE_ARGV_FILE
+# when set, so tests can assert the prompt and flags of the invocation.
+set -u
+
+if [ -n "${FAKE_CLAUDE_ARGV_FILE:-}" ]; then
+  printf '%s\n' "$@" > "$FAKE_CLAUDE_ARGV_FILE"
+fi
+
+case "${FAKE_CLAUDE_MODE:-good}" in
+  good)
+    mkdir -p src
+    cat > src/feature.js <<'EOF'
+// added by agent
+module.exports = { feature: true };
+EOF
+    echo "I read the task description and created src/feature.js."
+    echo "Ran the acceptance gate; it exits 0. Done."
+    ;;
+  bad)
+    printf 'this is not valid javascript {{{\n' > src/app.js
+    echo "I refactored src/app.js to implement the task."
+    ;;
+  noop)
+    echo "Upon inspection, no changes were needed."
+    ;;
+  crash)
+    echo "fatal: simulated agent crash" >&2
+    exit 1
+    ;;
+  *)
+    echo "fake-claude: unknown FAKE_CLAUDE_MODE \"${FAKE_CLAUDE_MODE}\"" >&2
+    exit 99
+    ;;
+esac
+exit 0
