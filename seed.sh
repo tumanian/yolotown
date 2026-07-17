@@ -4,6 +4,12 @@
 #   /path/to/seed.sh <task-name> "<task description>"
 set -uo pipefail
 
+# seed.sh runs from the *target* repo root, so locate our own libs by path.
+SEED_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/config.sh
+. "$SEED_DIR/lib/config.sh" \
+  || { printf 'seed: error: cannot source %s/lib/config.sh (broken install)\n' "$SEED_DIR" >&2; exit 1; }
+
 usage() {
   cat >&2 <<'USAGE'
 usage: seed.sh <task-name> "<task description>"
@@ -16,8 +22,7 @@ USAGE
   exit 2
 }
 
-conf_die() { printf 'seed: config error: %s\n' "$*" >&2; exit 2; }
-die()      { printf 'seed: error: %s\n'        "$*" >&2; exit 1; }
+die() { printf 'seed: error: %s\n' "$*" >&2; exit 1; }
 
 # ---- args ------------------------------------------------------------------
 [ $# -eq 2 ] || usage
@@ -30,35 +35,8 @@ fi
 [ -n "$TASK_DESC" ] || usage
 
 # ---- config ----------------------------------------------------------------
-[ -f ./.yolotown.conf ] || conf_die "no .yolotown.conf in $PWD
-a minimal valid config:
-  TEST_CMD=\"npm test\""
-
-TEST_CMD=""
-ENV_FILES=""
-INVARIANTS_FILE=""
-BASE_BRANCH="main"
-BRANCH_PREFIX="feature/"
-PUSH_ON_GREEN="true"
-WORKER_MODEL=""
-CLAUDE_BIN="claude"
-
-# shellcheck source=/dev/null
-. ./.yolotown.conf || conf_die ".yolotown.conf failed to source (must be plain shell key=value)"
-
-[ -n "$TEST_CMD" ] || conf_die "TEST_CMD is required and missing
-a minimal valid config:
-  TEST_CMD=\"npm test\""
-case "$PUSH_ON_GREEN" in
-  true|false) ;;
-  *) conf_die "PUSH_ON_GREEN must be \"true\" or \"false\" (got \"$PUSH_ON_GREEN\")" ;;
-esac
-if [ -z "$INVARIANTS_FILE" ] && [ -f CLAUDE.md ]; then
-  INVARIANTS_FILE="CLAUDE.md"
-fi
-if [ -n "$INVARIANTS_FILE" ] && [ ! -f "$INVARIANTS_FILE" ]; then
-  conf_die "INVARIANTS_FILE \"$INVARIANTS_FILE\" does not exist"
-fi
+# Defaults, sourcing, and validation all live in lib/config.sh.
+yt_load_config
 
 # ---- preflight ---------------------------------------------------------------
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git repository"
