@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# gh shim: substituted for the real gh CLI via GH_BIN in setup.sh tests.
+# Mimics `gh repo create --source=. --remote=<name> --private|--public`:
+# on success it adds the remote itself (the real gh does the same) and
+# exits 0; on failure it exits 1 without touching remotes.
+# Behavior via FAKE_GH_MODE (good | fail). Always records argv to
+# $FAKE_GH_ARGV_FILE when set, so tests can assert the invocation.
+set -u
+
+if [ -n "${FAKE_GH_ARGV_FILE:-}" ]; then
+  printf '%s\n' "$@" > "$FAKE_GH_ARGV_FILE"
+fi
+
+case "${FAKE_GH_MODE:-good}" in
+  good)
+    remote_name="origin"
+    for a in "$@"; do
+      case "$a" in --remote=*) remote_name="${a#--remote=}" ;; esac
+    done
+    repo_name="$(basename "$(pwd)")"
+    git remote add "$remote_name" "https://github.com/fake-owner/${repo_name}.git"
+    echo "created https://github.com/fake-owner/${repo_name}"
+    ;;
+  fail)
+    echo "gh: HTTP 422: Repository creation failed (simulated)" >&2
+    exit 1
+    ;;
+  *)
+    echo "fake-gh: unknown FAKE_GH_MODE \"${FAKE_GH_MODE}\"" >&2
+    exit 99
+    ;;
+esac
+exit 0

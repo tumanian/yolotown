@@ -15,7 +15,8 @@ parallel fan-out → conflict detection and the gated refactor stage) is built
 ## Requirements
 
 A plain macOS/Linux shell with `git`, `node`, and the `claude` CLI. Nothing
-else — no jq, no frameworks, no package installs.
+else — no jq, no frameworks, no package installs. `gh` is optional, used
+only by `setup.sh` to create a GitHub remote on request.
 
 ## Quickstart
 
@@ -24,6 +25,17 @@ In the target repo's root, create `.yolotown.conf`:
 ```sh
 TEST_CMD="npm test"
 ```
+
+If `PUSH_ON_GREEN` is enabled (the default) and the repo has no `origin`
+remote yet, run `setup.sh` once to add or create one:
+
+```sh
+/path/to/yolotown/setup.sh
+```
+
+It asks whether you already have a remote to use, and otherwise offers to
+create a GitHub repo via `gh` (if installed). Skip this and set
+`PUSH_ON_GREEN="false"` if you want to stay local.
 
 Make sure you're on the base branch, clean, with a green suite. Then:
 
@@ -67,7 +79,7 @@ are accepted and ignored by the seed.
 ## Testing
 
 ```sh
-./test.sh              # full suite; mocks only the agent, everything else is real
+./test.sh              # full suite; mocks only external side-effecting binaries
 RUN_LIVE=1 ./test.sh   # also run the one live smoke test (costs tokens)
 KEEP_TMP=1 ./test.sh   # preserve test temp dirs for autopsy
 ```

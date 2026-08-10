@@ -12,9 +12,14 @@ suite is green.
 - Never weaken, delete, or edit an existing test to make it pass. A red gate
   means the work is wrong, not the test.
 - Every feature ships with its tests in the same branch.
-- Tests mock exactly one thing: the agent, via `CLAUDE_BIN` pointing at
-  `tests/fake-claude`. Everything else — git, worktrees, pushes, exit
-  codes — is real.
+- Tests mock only external binaries whose real invocation is unsafe or
+  costly in a test run — never local git/filesystem operations, which stay
+  real. Today that's the agent, via `CLAUDE_BIN` pointing at
+  `tests/fake-claude` (real calls cost tokens and are nondeterministic), and
+  `gh`, via `GH_BIN` pointing at `tests/fake-gh` (real calls create actual
+  GitHub repos). Everything else — git, worktrees, pushes, exit codes — is
+  real. Don't add a new mock seam for a binary whose test invocations are
+  already safe and free.
 - The tool writes only to worktrees, `.yolotown/`, and remote feature
   branches. Never auto-merge to the base branch. Never leave the base branch
   red or modified.

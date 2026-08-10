@@ -10,15 +10,19 @@ during implementation, are listed in the DEVIATIONS section at the bottom.
 ```
 yolotown/
 ├── seed.sh                   # Stage-0 orchestrator (future run-one semantics)
+├── setup.sh                  # one-time per-target-repo bootstrap (added 2026-07-20; see addendum)
 ├── test.sh                   # runner: executes tests/*.test.sh, nonzero on any failure
 ├── tests/
 │   ├── helpers.sh            # fixture repo + bare origin builders, asserts, cleanup trap
 │   ├── fake-claude           # agent shim, behavior via FAKE_CLAUDE_MODE
+│   ├── fake-gh               # gh shim, behavior via FAKE_GH_MODE (added 2026-07-20)
 │   ├── green-path.test.sh
 │   ├── red-path.test.sh
 │   ├── env-files.test.sh
 │   ├── crash.test.sh         # also hosts the noop case (agent-misbehavior cluster)
 │   ├── fail-fast.test.sh
+│   ├── base-branch.test.sh   # missing BASE_BRANCH confirmation (added 2026-07-17)
+│   ├── setup.test.sh         # setup.sh (added 2026-07-20)
 │   └── live-smoke.test.sh    # real claude CLI, skipped unless RUN_LIVE=1
 ├── CLAUDE.md                 # invariants for self-building agents
 ├── .yolotown.conf            # yolotown targeting itself; PUSH_ON_GREEN=false until a remote exists
@@ -168,6 +172,39 @@ git push origin --delete <BRANCH_PREFIX><name>    # only if pushed
 
 Out of seed scope, recorded so Stage 1+ picks them up: `git worktree prune`,
 resumability, agent timeout, lane checking.
+
+## Addendum — setup.sh (added 2026-07-20)
+
+A standalone script, separate from `seed.sh`, for the one-time-per-target-repo
+concern of ensuring an `origin` remote exists (`PUSH_ON_GREEN` needs one to
+push to). Deliberately not folded into `seed.sh`'s preflight or the deferred
+v2 `init` orientation step — it's a narrower, immediately-useful piece of
+that eventual bootstrap, standing alone until `init` subsumes it.
+
+Flow: same repo-root preflight as `seed.sh`. If `origin` already resolves,
+report it and exit 0 (no-op, no prompt). Otherwise: ask `y/N` whether the
+user already has a remote — `y` prompts for a URL and `git remote add
+origin`s it (empty URL is refused, nothing added); anything else falls
+through to a `gh`-availability check (`command -v "$GH_BIN"`, default `gh`).
+No `gh`: fail with manual instructions, mentioning `PUSH_ON_GREEN="false"`
+as the local-only escape hatch. `gh` present: ask `y/N` to create a repo now
+via `gh repo create --source=. --remote=origin --<public|private>`
+(visibility prompted, default `private`, invalid values refused). Every
+decline path fails loud rather than silently proceeding without a remote —
+same "never guess" discipline as the rest of the tool.
+
+**Testing seam, and the CLAUDE.md change it required:** `gh repo create`
+is a real network call that creates an actual GitHub repo — unsafe to run
+in a test suite. `GH_BIN` (default `gh`) is a second injectable seam,
+mirroring `CLAUDE_BIN`, pointed at `tests/fake-gh` in tests (`FAKE_GH_MODE`:
+`good` adds a fake remote and exits 0, mimicking what real `gh` does;
+`fail` exits 1 untouched). This required broadening CLAUDE.md's "mocks
+exactly one thing" invariant to "mocks external binaries unsafe or costly
+to invoke for real" — still narrow (git/worktree/push stay real), but no
+longer literally one seam. `tests/setup.test.sh` covers: already-configured
+no-op, user-supplied URL (and the empty-URL refusal), no-`gh` failure,
+double-decline failure, gh-creation success with default and explicit
+visibility, invalid visibility, and `gh repo create` itself failing.
 
 ## DEVIATIONS
 

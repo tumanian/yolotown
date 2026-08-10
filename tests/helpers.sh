@@ -5,7 +5,9 @@ set -u
 
 YOLOTOWN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SEED="$YOLOTOWN_ROOT/seed.sh"
+SETUP="$YOLOTOWN_ROOT/setup.sh"
 FAKE_CLAUDE="$YOLOTOWN_ROOT/tests/fake-claude"
+FAKE_GH="$YOLOTOWN_ROOT/tests/fake-gh"
 
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/yolotown-test.XXXXXX")"
 REPO="$TMP_ROOT/repo"
@@ -95,6 +97,22 @@ run_seed_with_input() {
   local input="$1"; shift
   SEED_OUT="$(cd "$REPO" && printf '%s\n' "$input" | "$SEED" "$@" 2>&1)"
   SEED_RC=$?
+}
+
+# run_setup — sets SETUP_RC and SETUP_OUT. stdin is /dev/null (see run_seed).
+run_setup() {
+  SETUP_OUT="$(cd "$REPO" && "$SETUP" </dev/null 2>&1)"
+  SETUP_RC=$?
+}
+
+# run_setup_with_input <raw-stdin> — like run_setup, but pipes the given
+# string verbatim as stdin. Pass a $'...\n...\n' literal for multiple
+# prompts (e.g. $'n\ny\n\n' = decline own remote, accept gh creation,
+# accept default visibility).
+run_setup_with_input() {
+  local input="$1"
+  SETUP_OUT="$(cd "$REPO" && printf '%s' "$input" | "$SETUP" 2>&1)"
+  SETUP_RC=$?
 }
 
 # ---- asserts ----------------------------------------------------------------
