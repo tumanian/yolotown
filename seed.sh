@@ -2,6 +2,11 @@
 # yolotown seed (Stage 0): one task, one agent, one worktree, gate, ship.
 # Run from the target repo root (the directory containing .yolotown.conf):
 #   /path/to/seed.sh <task-name> "<task description>"
+#
+# The per-task pipeline itself (worktree, env files, prompt, agent, gate,
+# commit, push) lives in lib/task.sh and is shared with `yolotown run`. This
+# script is a thin wrapper: whole-repo preflight, one run dir with one task
+# registered, a single call into that core, then the single-task report.
 set -uo pipefail
 
 # seed.sh runs from the *target* repo root, so locate our own libs by path.
@@ -12,6 +17,9 @@ SEED_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/rundir.sh
 . "$SEED_DIR/lib/rundir.sh" \
   || { printf 'seed: error: cannot source %s/lib/rundir.sh (broken install)\n' "$SEED_DIR" >&2; exit 1; }
+# shellcheck source=lib/task.sh
+. "$SEED_DIR/lib/task.sh" \
+  || { printf 'seed: error: cannot source %s/lib/task.sh (broken install)\n' "$SEED_DIR" >&2; exit 1; }
 
 usage() {
   cat >&2 <<'USAGE'
@@ -96,64 +104,31 @@ RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
 YT_DIR="$TOPLEVEL/.yolotown"
 RUN_DIR="$(yt_run_create "$YT_DIR" "$RUN_TS")" || die "could not create a run dir under $YT_DIR"
 yt_status_init "$RUN_DIR" "$TASK_NAME" || die "could not register task \"$TASK_NAME\" in $RUN_DIR"
-: > "$RUN_DIR/logs/${TASK_NAME}.log"
 LOG_DIR="$YT_DIR/logs"
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/${TASK_NAME}-${RUN_TS}.log"
 ln -sfn "../$(basename "$RUN_DIR")/logs/${TASK_NAME}.log" "$LOG"
-log() { printf '%s\n' "$*" | tee -a "$LOG"; }
-log "seed: task=$TASK_NAME branch=$BRANCH"
-log "seed: run=$RUN_DIR"
-log "seed: log=$LOG"
 
-# ---- worktree -----------------------------------------------------------------
-git worktree add "$WORKTREE" -b "$BRANCH" "$BASE_BRANCH" >>"$LOG" 2>&1 \
-  || die "git worktree add failed (see $LOG)"
-
-# Allowed ONLY before the agent has run: undo a seconds-old, workless worktree.
-remove_fresh_worktree() {
-  git worktree remove --force "$WORKTREE" >/dev/null 2>&1 || true
-  git branch -D "$BRANCH" >/dev/null 2>&1 || true
-}
-
-for f in $ENV_FILES; do
-  mkdir -p "$WORKTREE/$(dirname "$f")"
-  cp "$f" "$WORKTREE/$f"
-  if ! git -C "$WORKTREE" check-ignore -q "$f"; then
-    remove_fresh_worktree
-    die "ENV_FILES entry \"$f\" is not git-ignored in the worktree; it would be committed. Add it to .gitignore. (fresh worktree and branch removed)"
-  fi
-done
-
-# ---- worker prompt ----------------------------------------------------------------
+# ---- run the task -----------------------------------------------------------
+# yt_run_task (lib/task.sh) owns the whole per-task pipeline. It reads config as
+# globals, so hand it the invariants text and the worktree parent, then dispatch
+# our single task into the shared run dir. It returns 0/1/2 rather than exiting,
+# leaving the outcome in the YT_TASK_* globals for the report below.
 if [ -n "$INVARIANTS_FILE" ]; then
   INVARIANTS_CONTENT="$(cat "$INVARIANTS_FILE")"
 else
   INVARIANTS_CONTENT="None provided."
 fi
+WORKTREE_PARENT="$(dirname "$TOPLEVEL")"
 
-PROMPT="You are completing one software task inside an isolated git worktree.
-The current directory is the worktree; it is yours alone.
+yt_run_task "$RUN_DIR" "$TASK_NAME" "$TASK_DESC"
+TASK_RC=$?
+PUSHED="$YT_TASK_PUSHED"
 
-TASK: ${TASK_NAME}
-DESCRIPTION: ${TASK_DESC}
-
-ACCEPTANCE GATE: the command \`${TEST_CMD}\` must exit 0. Run it yourself
-before finishing. You are done only when it passes.
-
-RULES:
-- Never weaken, delete, or edit an existing test to make it pass. A red
-  gate means the work is wrong, not the test.
-- Do not run any git commands that commit, push, branch, or merge; the
-  orchestrator owns git. Read-only git (status, diff, log) is fine.
-- Work only inside the current directory.
-- If the description references spec files in the repo, read them first.
-
-REPOSITORY INVARIANTS (obey these):
-${INVARIANTS_CONTENT}"
-
-# ---- reporting ----------------------------------------------------------------
-PUSHED="no"
+# ---- report -----------------------------------------------------------------
+# yt_run_task already drove the status machine and left the worktree intact on
+# any failure; here we only render the single-task report. The branch/worktree
+# are the ones seed computed in preflight (identical to what the core used).
 print_cleanup() {
   echo "cleanup:"
   echo "  git worktree remove --force $WORKTREE"
@@ -162,54 +137,23 @@ print_cleanup() {
     echo "  git push origin --delete $BRANCH"
   fi
 }
-fail_task() {
-  # Every fail_task call is post-agent, so the run is already "running"; the
-  # running -> failed edge is legal. Silenced so a stray status error can never
-  # bleed into the report.
-  yt_status_set "$RUN_DIR" "$TASK_NAME" failed >/dev/null 2>&1 || true
-  {
-    echo ""
-    echo "RESULT: FAILED ($1)"
-    echo "run:      $RUN_DIR"
-    echo "log:      $LOG"
-    echo "worktree: $WORKTREE"
-    print_cleanup
-  } | tee -a "$LOG"
-  exit 1
-}
 
-# ---- agent ----------------------------------------------------------------------
-yt_status_set "$RUN_DIR" "$TASK_NAME" running >/dev/null 2>&1 || true
-log "seed: agent: $CLAUDE_BIN (model: ${WORKER_MODEL:-cli default})"
-(
-  cd "$WORKTREE" && "$CLAUDE_BIN" -p "$PROMPT" \
-    ${WORKER_MODEL:+--model "$WORKER_MODEL"} \
-    --allowedTools "Edit" "Write" "Read" "Glob" "Grep" "Bash"
-) 2>&1 | tee -a "$LOG"
-AGENT_RC="${PIPESTATUS[0]}"
-[ "$AGENT_RC" -eq 0 ] || fail_task "agent exited nonzero ($AGENT_RC)"
-
-[ -n "$(git -C "$WORKTREE" status --porcelain)" ] || fail_task "agent made no changes"
-
-# ---- gate -------------------------------------------------------------------------
-log "seed: gate: $TEST_CMD"
-( cd "$WORKTREE" && bash -c "$TEST_CMD" ) 2>&1 | tee -a "$LOG"
-GATE_RC="${PIPESTATUS[0]}"
-[ "$GATE_RC" -eq 0 ] || fail_task "gate red, exit $GATE_RC"
-
-# ---- ship ---------------------------------------------------------------------------
-SUBJECT="feat(${TASK_NAME}): $(printf '%s' "$TASK_DESC" | cut -c1-60)"
-BODY="Task: ${TASK_DESC}
-
-Authored by yolotown seed via headless claude agent."
-git -C "$WORKTREE" add -A
-git -C "$WORKTREE" commit -m "$SUBJECT" -m "$BODY" >>"$LOG" 2>&1 || fail_task "git commit failed"
-
-if [ "$PUSH_ON_GREEN" = "true" ]; then
-  if git -C "$WORKTREE" push -u origin "$BRANCH" 2>&1 | tee -a "$LOG"; then
-    PUSHED="yes"
-  else
-    yt_status_set "$RUN_DIR" "$TASK_NAME" failed >/dev/null 2>&1 || true
+case "$TASK_RC" in
+  0)
+    {
+      echo ""
+      echo "RESULT: PASSED"
+      echo "branch:   $BRANCH (pushed: $PUSHED)"
+      echo "run:      $RUN_DIR"
+      echo "log:      $LOG"
+      echo "worktree: $WORKTREE"
+      echo "merge:    git checkout $BASE_BRANCH && git merge --no-ff $BRANCH"
+      print_cleanup
+    } | tee -a "$LOG"
+    exit 0
+    ;;
+  2)
+    # Committed locally, but the push failed: the commit stands on the branch.
     {
       echo ""
       echo "RESULT: PASSED-LOCALLY (push failed; commit stands on $BRANCH)"
@@ -220,18 +164,16 @@ if [ "$PUSH_ON_GREEN" = "true" ]; then
       print_cleanup
     } | tee -a "$LOG"
     exit 1
-  fi
-fi
-
-yt_status_set "$RUN_DIR" "$TASK_NAME" passed >/dev/null 2>&1 || true
-{
-  echo ""
-  echo "RESULT: PASSED"
-  echo "branch:   $BRANCH (pushed: $PUSHED)"
-  echo "run:      $RUN_DIR"
-  echo "log:      $LOG"
-  echo "worktree: $WORKTREE"
-  echo "merge:    git checkout $BASE_BRANCH && git merge --no-ff $BRANCH"
-  print_cleanup
-} | tee -a "$LOG"
-exit 0
+    ;;
+  *)
+    {
+      echo ""
+      echo "RESULT: FAILED ($YT_TASK_REASON)"
+      echo "run:      $RUN_DIR"
+      echo "log:      $LOG"
+      echo "worktree: $WORKTREE"
+      print_cleanup
+    } | tee -a "$LOG"
+    exit 1
+    ;;
+esac
