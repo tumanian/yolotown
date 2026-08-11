@@ -264,3 +264,14 @@ scheduled for correction or explicitly accepted.
 - **`.yolotown/logs/<name>-<ts>.log` retained** as a symlink into the run dir
   for discoverability. Not in the spec's layout; harmless, revisit when `clean`
   learns to prune old runs.
+- **`plan` is a placeholder** (introduced with the `cli` task). Spec §2 defines
+  `plan` as conflict detection that prints DISJOINT / COLLIDING-SPLITTABLE /
+  INHERENTLY-COUPLED buckets. Today it only parses `tasks.txt` and lists the
+  tasks, touching nothing — its usage text claims no more than that. The real
+  implementation is Stage 3 work (§3.1); until then `plan` is a backlog
+  linter, not a conflict detector.
+- **The agent prompt does not inject this file.** `seed.sh` splices
+  `INVARIANTS_FILE` (`CLAUDE.md`) into every worker prompt, but SPEC.md is only
+  read if a task description happens to name it. Task descriptions currently
+  cite the relevant section by hand; that is discipline, not mechanism. Worth a
+  prompt line or a `CONTEXT_FILES` config key after Stage 1.
