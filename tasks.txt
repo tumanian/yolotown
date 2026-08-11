@@ -1,15 +1,20 @@
 # Stage 1 backlog: serial self-build.
 # Format: <short-name> | <description>
-# Not yet executable as a file — tasks-parser (below) and the `run` subcommand
-# (part of cli) are what teach yolotown to read this file. Until then, dispatch
-# each line manually, in order, one at a time:
+#
+# SPEC.md in this repo is the authoritative specification. These descriptions
+# are a compressed index of it, not a replacement — when dispatching a task,
+# the agent should read the relevant SPEC.md section too. Where a description
+# here and SPEC.md disagree, SPEC.md wins; say so rather than silently picking.
+#
+# The `run` subcommand (part of cli) is what teaches yolotown to read this
+# file. Until then, dispatch each line manually, in order, one at a time:
 #   ./seed.sh <short-name> "<description>"
 # reviewing and merging the green branch before starting the next line, per
 # the Stage 1 working agreement (serial = the human is the conflict detector).
+#
+# DONE: config-loader (ebb6522), tasks-parser (fd212c3), run-dir (2a913ec).
 
-config-loader | Extract config handling into lib/config.sh with all defaults and fail-fast validation, matching the behavior currently inline in seed.sh. Ship with tests; seed.sh should source lib/config.sh instead of doing this itself.
-tasks-parser | Implement lib/tasks.sh: parse a tasks.txt file per the documented format (<short-name> | <description>, names match [a-z0-9-]+, no duplicate names, # comments and blank lines allowed), producing line-numbered errors on malformed input. Ship with tests; not wired into seed.sh yet.
-run-dir | Implement lib/rundir.sh: create .yolotown/run-<UTC timestamp>/ directories, a status state machine (pending, running, passed, failed, skipped) with enforced transitions (illegal transitions rejected), and a .yolotown/latest symlink to the newest run. Move seed's log output into the run dir. Ship with tests.
-report | Implement the fan-in report table (PASSED / PASSED-WITH-WARNING / FAILED / SKIPPED with log/worktree paths), cleanup and merge command emission, and a `status` subcommand that reads .yolotown/latest. Ship with tests.
-cli | Implement the yolotown entrypoint with subcommand dispatch (plan, run, run-one, status, clean). `run` iterates a tasks file serially using lib/tasks.sh, continuing past individual task failures; `run-one` preserves today's single-task seed.sh behavior; `clean` prints worktree/branch removal commands and only executes them with --force. Ship with tests.
-fan-out | Implement bounded parallel workers via subshells honoring MAX_PARALLEL (with a --parallel N override and a --serial fallback), per-worker status files via lib/rundir.sh, and crash containment (one worker's crash never kills the run), followed by the fan-in report. Tests must prove the concurrency bound using shim sleeps. Ship with tests.
+rundir-per-task | Convert lib/rundir.sh from per-run state to per-task state, matching SPEC.md section 2: each run dir holds status/<task> (a directory, one single-word file per task) and logs/<task>.log, instead of today's single run-<ts>/status file and run-<ts>/<task>.log. Keep the existing state machine and its enforced transitions exactly as they are — only the granularity changes. yt_status_get/yt_status_set take a task name as well as a run dir. Update seed.sh accordingly. This must land before report and fan-out, which both assume per-task status. Ship with tests, including one proving two tasks in the same run hold independent states.
+report | Implement the fan-in report table (PASSED / PASSED-WITH-WARNING / FAILED / SKIPPED with log/worktree paths), cleanup and merge command emission, and a `status` subcommand that reads .yolotown/latest. The table is per-task, reading the per-task status files from rundir-per-task. See SPEC.md sections 3.5 and 2. Ship with tests.
+cli | Implement the yolotown entrypoint with subcommand dispatch (plan, run, run-one, status, clean). `run` iterates a tasks file serially using lib/tasks.sh, continuing past individual task failures; `run-one` preserves today's single-task seed.sh behavior; `clean` prints worktree/branch removal commands and only executes them with --force. See SPEC.md section 2 for the final CLI surface. Ship with tests.
+fan-out | Implement bounded parallel workers via subshells honoring MAX_PARALLEL (with a --parallel N override and a --serial fallback), per-worker status files via lib/rundir.sh, and crash containment (one worker's crash never kills the run), followed by the fan-in report. See SPEC.md section 3.3. Tests must prove the concurrency bound using shim sleeps. Ship with tests.

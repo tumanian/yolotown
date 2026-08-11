@@ -174,8 +174,28 @@ PARSE_OUT="$(yt_parse_tasks "$YOLOTOWN_ROOT/tasks.txt" 2>"$TASKS_DIR/err")"; PAR
 PARSE_ERR="$(cat "$TASKS_DIR/err")"
 assert_eq "$PARSE_RC" 0 "repo tasks.txt parses cleanly"
 assert_eq "$PARSE_ERR" "" "repo tasks.txt has no errors"
-assert_contains "$PARSE_OUT" "tasks-parser${TAB}" "repo tasks.txt yields the tasks-parser task"
-assert_contains "$PARSE_OUT" "config-loader${TAB}" "repo tasks.txt yields the config-loader task"
+# Structural, so this keeps its teeth as completed tasks leave the backlog:
+# every emitted line must carry a valid name, a TAB, and a non-empty
+# description. Asserting only on hardcoded task names would rot the moment a
+# task ships and is removed from the file.
+[ -n "$PARSE_OUT" ] || _fail "repo tasks.txt should yield at least one task"
+while IFS= read -r emitted; do
+  case "$emitted" in
+    *"$TAB"*) ;;
+    *) _fail "repo tasks.txt line emitted without a TAB separator: $emitted" ;;
+  esac
+  emitted_name="${emitted%%"$TAB"*}"
+  emitted_desc="${emitted#*"$TAB"}"
+  case "$emitted_name" in
+    ""|*[!a-z0-9-]*) _fail "repo tasks.txt emitted an invalid task name: \"$emitted_name\"" ;;
+  esac
+  [ -n "$emitted_desc" ] || _fail "repo tasks.txt task \"$emitted_name\" has an empty description"
+done <<EOF
+$PARSE_OUT
+EOF
+# The next task to dispatch must be present by name, so an accidental
+# truncation of the backlog fails loudly rather than silently passing.
+assert_contains "$PARSE_OUT" "fan-out${TAB}" "repo tasks.txt still carries the final Stage 1 task"
 ok "repo tasks.txt is well-formed"
 
 echo "tasks: all cases passed"
