@@ -12,9 +12,9 @@
 # reviewing and merging the green branch before starting the next line, per
 # the Stage 1 working agreement (serial = the human is the conflict detector).
 #
-# DONE: config-loader (ebb6522), tasks-parser (fd212c3), run-dir (2a913ec).
+# DONE: config-loader (ebb6522), tasks-parser (fd212c3), run-dir (2a913ec),
+#       rundir-per-task (43d0f80).
 
-rundir-per-task | Convert lib/rundir.sh from per-run state to per-task state, matching SPEC.md section 2: each run dir holds status/<task> (a directory, one single-word file per task) and logs/<task>.log, instead of today's single run-<ts>/status file and run-<ts>/<task>.log. Keep the existing state machine and its enforced transitions exactly as they are — only the granularity changes. yt_status_get/yt_status_set take a task name as well as a run dir. Update seed.sh accordingly. This must land before report and fan-out, which both assume per-task status. Ship with tests, including one proving two tasks in the same run hold independent states.
 report | Implement the fan-in report table (PASSED / PASSED-WITH-WARNING / FAILED / SKIPPED with log/worktree paths), cleanup and merge command emission, and a `status` subcommand that reads .yolotown/latest. The table is per-task, reading the per-task status files from rundir-per-task. See SPEC.md sections 3.5 and 2. Ship with tests.
 cli | Implement the yolotown entrypoint with subcommand dispatch (plan, run, run-one, status, clean). `run` iterates a tasks file serially using lib/tasks.sh, continuing past individual task failures; `run-one` preserves today's single-task seed.sh behavior; `clean` prints worktree/branch removal commands and only executes them with --force. See SPEC.md section 2 for the final CLI surface. Ship with tests.
 fan-out | Implement bounded parallel workers via subshells honoring MAX_PARALLEL (with a --parallel N override and a --serial fallback), per-worker status files via lib/rundir.sh, and crash containment (one worker's crash never kills the run), followed by the fan-in report. See SPEC.md section 3.3. Tests must prove the concurrency bound using shim sleeps. Ship with tests.
