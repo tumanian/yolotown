@@ -9,6 +9,9 @@ SEED_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/config.sh
 . "$SEED_DIR/lib/config.sh" \
   || { printf 'seed: error: cannot source %s/lib/config.sh (broken install)\n' "$SEED_DIR" >&2; exit 1; }
+# shellcheck source=lib/rundir.sh
+. "$SEED_DIR/lib/rundir.sh" \
+  || { printf 'seed: error: cannot source %s/lib/rundir.sh (broken install)\n' "$SEED_DIR" >&2; exit 1; }
 
 usage() {
   cat >&2 <<'USAGE'
@@ -82,14 +85,23 @@ done
 echo "seed: base gate: $TEST_CMD"
 bash -c "$TEST_CMD" || die "base suite is red; refusing to start (fix the base branch first)"
 
-# ---- log ------------------------------------------------------------------------
+# ---- run dir + log ----------------------------------------------------------
+# The run dir is this run's flat-file home: its status state machine lives in
+# .yolotown/run-<ts>/status, and the log's bytes live in .yolotown/run-<ts>/.
+# .yolotown/logs/<name>-<ts>.log is kept as a symlink into the run dir, so the
+# log stays discoverable by name while the run dir owns it. yt_run_create also
+# repoints .yolotown/latest at this run.
 RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
-LOG_DIR="$TOPLEVEL/.yolotown/logs"
+YT_DIR="$TOPLEVEL/.yolotown"
+RUN_DIR="$(yt_run_create "$YT_DIR" "$RUN_TS")" || die "could not create a run dir under $YT_DIR"
+: > "$RUN_DIR/${TASK_NAME}.log"
+LOG_DIR="$YT_DIR/logs"
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/${TASK_NAME}-${RUN_TS}.log"
-: > "$LOG"
+ln -sfn "../$(basename "$RUN_DIR")/${TASK_NAME}.log" "$LOG"
 log() { printf '%s\n' "$*" | tee -a "$LOG"; }
 log "seed: task=$TASK_NAME branch=$BRANCH"
+log "seed: run=$RUN_DIR"
 log "seed: log=$LOG"
 
 # ---- worktree -----------------------------------------------------------------
@@ -149,9 +161,14 @@ print_cleanup() {
   fi
 }
 fail_task() {
+  # Every fail_task call is post-agent, so the run is already "running"; the
+  # running -> failed edge is legal. Silenced so a stray status error can never
+  # bleed into the report.
+  yt_status_set "$RUN_DIR" failed >/dev/null 2>&1 || true
   {
     echo ""
     echo "RESULT: FAILED ($1)"
+    echo "run:      $RUN_DIR"
     echo "log:      $LOG"
     echo "worktree: $WORKTREE"
     print_cleanup
@@ -160,6 +177,7 @@ fail_task() {
 }
 
 # ---- agent ----------------------------------------------------------------------
+yt_status_set "$RUN_DIR" running >/dev/null 2>&1 || true
 log "seed: agent: $CLAUDE_BIN (model: ${WORKER_MODEL:-cli default})"
 (
   cd "$WORKTREE" && "$CLAUDE_BIN" -p "$PROMPT" \
@@ -189,10 +207,12 @@ if [ "$PUSH_ON_GREEN" = "true" ]; then
   if git -C "$WORKTREE" push -u origin "$BRANCH" 2>&1 | tee -a "$LOG"; then
     PUSHED="yes"
   else
+    yt_status_set "$RUN_DIR" failed >/dev/null 2>&1 || true
     {
       echo ""
       echo "RESULT: PASSED-LOCALLY (push failed; commit stands on $BRANCH)"
       echo "retry:    git -C $WORKTREE push -u origin $BRANCH"
+      echo "run:      $RUN_DIR"
       echo "log:      $LOG"
       echo "worktree: $WORKTREE"
       print_cleanup
@@ -201,10 +221,12 @@ if [ "$PUSH_ON_GREEN" = "true" ]; then
   fi
 fi
 
+yt_status_set "$RUN_DIR" passed >/dev/null 2>&1 || true
 {
   echo ""
   echo "RESULT: PASSED"
   echo "branch:   $BRANCH (pushed: $PUSHED)"
+  echo "run:      $RUN_DIR"
   echo "log:      $LOG"
   echo "worktree: $WORKTREE"
   echo "merge:    git checkout $BASE_BRANCH && git merge --no-ff $BRANCH"
