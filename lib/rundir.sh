@@ -1,27 +1,30 @@
 #!/usr/bin/env bash
 # yolotown run directories: each run gets a flat-file home under .yolotown/,
-# named by the UTC time it was created, holding a status file and the run's
-# log. A `latest` symlink always points at the newest run.
+# named by the UTC time it was created. State inside a run is per task, not
+# per run: status/<task> holds a single-word status and logs/<task>.log holds
+# that task's log. A `latest` symlink always points at the newest run.
 #
-# Sourcing this file only defines functions; call yt_run_create to make a run
-# and yt_status_get / yt_status_set to drive its state machine.
+# Sourcing this file only defines functions; call yt_run_create to make a run,
+# yt_status_init to register a task in it (born pending), and yt_status_get /
+# yt_status_set to drive that task's state machine.
 #
-# Status state machine — a run is born "pending" and moves through exactly the
-# edges below; every other transition (including a no-op same-state set) is
+# Status state machine — every task is born "pending" and moves through exactly
+# the edges below; every other transition (including a no-op same-state set) is
 # rejected loudly:
 #
 #     pending ──▶ running ──▶ passed
 #        │           └──────▶ failed
 #        └──────────────────▶ skipped
 #
-#   pending  created, not yet started
+#   pending  registered, not yet started
 #   running  the agent / gate is in flight
-#   passed   terminal: the run succeeded
-#   failed   terminal: the run broke
-#   skipped  terminal: the run was deliberately not started
+#   passed   terminal: the task succeeded
+#   failed   terminal: the task broke
+#   skipped  terminal: the task was deliberately not started
 #
-# Terminal states have no outgoing edges. A run reaches "passed" only by way
-# of "running" — you cannot pass something that never ran.
+# Terminal states have no outgoing edges. A task reaches "passed" only by way
+# of "running" — you cannot pass something that never ran. Tasks in the same
+# run hold independent states: advancing one never touches another.
 
 # Error prefix; a CLI entrypoint can set YT_PROG to its own name.
 : "${YT_PROG:=yolotown}"
@@ -53,11 +56,33 @@ _yt_status_next() {
   esac
 }
 
+# _yt_task_file <run-dir> <task> — print the path to <task>'s status file,
+#   validating the run dir and the task name. Prints nothing and fails (with a
+#   message on stderr) if the run dir has no status/ directory or the task name
+#   is empty or contains a slash. Does NOT require the file to exist; callers
+#   check that themselves, as init and get/set want opposite answers.
+_yt_task_file() {
+  local dir="$1" task="$2"
+  if [ -z "$dir" ] || [ ! -d "$dir/status" ]; then
+    _yt_run_die "no run dir with a status/ directory at ${dir:-<unset>}/status"
+    return 1
+  fi
+  if [ -z "$task" ]; then
+    _yt_run_die "no task name given"
+    return 1
+  fi
+  case "$task" in
+    */*|.|..) _yt_run_die "invalid task name \"$task\" (must not contain \"/\")"; return 1 ;;
+  esac
+  printf '%s\n' "$dir/status/$task"
+}
+
 # yt_run_create <yolotown-dir> [timestamp]
-#   Make <yolotown-dir>/run-<ts>/, seed its status file to "pending", repoint
-#   <yolotown-dir>/latest at it, and print the run dir path. <ts> defaults to
-#   the current UTC time (YYYYMMDDTHHMMSSZ). A same-<ts> collision gets a
-#   -2, -3, ... suffix, so a run dir is never reused.
+#   Make <yolotown-dir>/run-<ts>/ with empty status/ and logs/ subdirs, repoint
+#   <yolotown-dir>/latest at it, and print the run dir path. No task status is
+#   seeded here — a run holds many tasks, each registered later via
+#   yt_status_init. <ts> defaults to the current UTC time (YYYYMMDDTHHMMSSZ). A
+#   same-<ts> collision gets a -2, -3, ... suffix, so a run dir is never reused.
 yt_run_create() {
   local ytdir="$1" ts="${2:-}"
   [ -n "$ytdir" ] || { _yt_run_die "yt_run_create: no .yolotown dir given"; return 1; }
@@ -72,7 +97,8 @@ yt_run_create() {
     dir="$ytdir/$base"
   done
   mkdir "$dir" || { _yt_run_die "cannot create run dir $dir"; return 1; }
-  printf 'pending\n' > "$dir/status"
+  mkdir "$dir/status" "$dir/logs" \
+    || { _yt_run_die "cannot create status/ and logs/ under $dir"; return 1; }
 
   # Relative symlink so .yolotown/ stays relocatable; -n so an existing
   # latest -> dir symlink is replaced, not descended into; -f to overwrite.
@@ -82,34 +108,50 @@ yt_run_create() {
   printf '%s\n' "$dir"
 }
 
-# yt_status_get <run-dir> — print the run's current status.
-yt_status_get() {
-  local dir="$1"
-  if [ -z "$dir" ] || [ ! -f "$dir/status" ]; then
-    _yt_run_die "yt_status_get: no status file at ${dir:-<unset>}/status"
+# yt_status_init <run-dir> <task> — register <task> in this run, born pending.
+#   Writes <run-dir>/status/<task> holding "pending". Refuses (nonzero) to
+#   clobber a task already registered in this run: a task is initialised once.
+yt_status_init() {
+  local dir="$1" task="$2" f
+  f="$(_yt_task_file "$dir" "$task")" || return 1
+  if [ -e "$f" ]; then
+    _yt_run_die "yt_status_init: task \"$task\" already registered in $dir (status is \"$(cat "$f")\")"
     return 1
   fi
-  cat "$dir/status"
+  printf 'pending\n' > "$f" \
+    || { _yt_run_die "cannot write status for task \"$task\" in $dir"; return 1; }
 }
 
-# yt_status_set <run-dir> <new-status> — enforce the transition, then write it.
-#   Rejects (nonzero, status left untouched) an unknown target status or an
-#   illegal edge, naming what was refused and the legal next states.
+# yt_status_get <run-dir> <task> — print <task>'s current status.
+yt_status_get() {
+  local dir="$1" task="$2" f
+  f="$(_yt_task_file "$dir" "$task")" || return 1
+  if [ ! -f "$f" ]; then
+    _yt_run_die "yt_status_get: task \"$task\" not registered in $dir (no status/$task)"
+    return 1
+  fi
+  cat "$f"
+}
+
+# yt_status_set <run-dir> <task> <new-status> — enforce the transition for
+#   <task>, then write it. Rejects (nonzero, status left untouched) an
+#   unregistered task, an unknown target status, or an illegal edge, naming
+#   what was refused and the legal next states.
 yt_status_set() {
-  local dir="$1" to="$2"
-  if [ -z "$dir" ] || [ ! -f "$dir/status" ]; then
-    _yt_run_die "yt_status_set: no status file at ${dir:-<unset>}/status"
+  local dir="$1" task="$2" to="$3" f from
+  f="$(_yt_task_file "$dir" "$task")" || return 1
+  if [ ! -f "$f" ]; then
+    _yt_run_die "yt_status_set: task \"$task\" not registered in $dir (no status/$task)"
     return 1
   fi
   if ! _yt_status_known "$to"; then
     _yt_run_die "unknown status \"$to\" (valid: pending running passed failed skipped)"
     return 1
   fi
-  local from
-  from="$(cat "$dir/status")"
+  from="$(cat "$f")"
   if ! _yt_status_legal "$from" "$to"; then
-    _yt_run_die "illegal transition \"$from\" -> \"$to\" for $dir (legal next from \"$from\": $(_yt_status_next "$from"))"
+    _yt_run_die "illegal transition \"$from\" -> \"$to\" for task \"$task\" in $dir (legal next from \"$from\": $(_yt_status_next "$from"))"
     return 1
   fi
-  printf '%s\n' "$to" > "$dir/status"
+  printf '%s\n' "$to" > "$f"
 }

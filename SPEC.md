@@ -261,14 +261,6 @@ that, once real second-repo friction shows what orientation must detect.
 Live list of places the code knowingly differs from this spec. Each is either
 scheduled for correction or explicitly accepted.
 
-- **Run state is per-run, not per-task** (introduced Stage 1 task 3, merge
-  `2a913ec`). Spec §2 calls for `run-<ts>/status/<task>` (a directory, one file
-  per task) and `run-<ts>/logs/<task>.log`. `lib/rundir.sh` currently writes a
-  single `run-<ts>/status` file and puts the log at `run-<ts>/<task>.log`.
-  Correct for the seed, which runs exactly one task per run; **must be converted
-  to per-task before `fan-out`**, where parallel workers each need their own
-  status file, and before `report`, whose table is per-task. Tracked as the
-  `rundir-per-task` entry in `tasks.txt`.
 - **`.yolotown/logs/<name>-<ts>.log` retained** as a symlink into the run dir
   for discoverability. Not in the spec's layout; harmless, revisit when `clean`
   learns to prune old runs.
