@@ -1,3 +1,4 @@
+<!-- yolotown: a CLI that orchestrates headless Claude Code agents to build features in isolated git worktrees, each gated by the target repo's own test suite. -->
 # YOLOTOWN
 
 A repo-agnostic command line tool that orchestrates headless Claude Code
