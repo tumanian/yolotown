@@ -13,8 +13,7 @@
 # the Stage 1 working agreement (serial = the human is the conflict detector).
 #
 # DONE: config-loader (ebb6522), tasks-parser (fd212c3), run-dir (2a913ec),
-#       rundir-per-task (43d0f80).
+#       rundir-per-task (43d0f80), report (504743d).
 
-report | Implement the fan-in report table (PASSED / PASSED-WITH-WARNING / FAILED / SKIPPED with log/worktree paths), cleanup and merge command emission, and a `status` subcommand that reads .yolotown/latest. The table is per-task, reading the per-task status files from rundir-per-task. See SPEC.md sections 3.5 and 2. Ship with tests.
-cli | Implement the yolotown entrypoint with subcommand dispatch (plan, run, run-one, status, clean). `run` iterates a tasks file serially using lib/tasks.sh, continuing past individual task failures; `run-one` preserves today's single-task seed.sh behavior; `clean` prints worktree/branch removal commands and only executes them with --force. See SPEC.md section 2 for the final CLI surface. Ship with tests.
+cli | Extend the existing yolotown entrypoint to full subcommand dispatch. It already implements `status` (added by the report task) and stubs plan/run/run-one/clean with a loud not-implemented error — replace those stubs, do not rewrite `status` or lib/report.sh. `run` iterates a tasks file serially using lib/tasks.sh, registering every task in one run dir up front via yt_status_init, continuing past individual task failures, and printing the fan-in report via yt_report at the end; `run-one` preserves today's single-task seed.sh behavior; `clean` prints worktree/branch removal commands and only executes them with --force. See SPEC.md section 2 for the final CLI surface. Ship with tests.
 fan-out | Implement bounded parallel workers via subshells honoring MAX_PARALLEL (with a --parallel N override and a --serial fallback), per-worker status files via lib/rundir.sh, and crash containment (one worker's crash never kills the run), followed by the fan-in report. See SPEC.md section 3.3. Tests must prove the concurrency bound using shim sleeps. Ship with tests.
