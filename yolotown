@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
-# yolotown entrypoint. Subcommand dispatch; today it implements `status`, the
-# per-task fan-in report read from .yolotown/latest. The remaining subcommands
-# (plan, run, run-one, clean) are the `cli` task's scope and land next in the
-# Stage 1 backlog; until then they route you to the seed for single-task runs.
+# yolotown entrypoint: subcommand dispatch over the Stage 1 pipeline.
+#
+#   plan [tasks.txt]           parse + list the backlog; a dry run, touches nothing
+#   run  [tasks.txt]           dispatch every task serially, one shared run dir,
+#                              continuing past individual failures, then report
+#   run-one <name> "<desc>"    single-task path (delegates to seed.sh verbatim)
+#   status                     per-task report table for the latest run
+#   clean [--force]            print (and with --force execute) worktree/branch removal
+#
+# `status` is unchanged from the report task; `run`/`run-one`/`clean`/`plan`
+# replace what used to be a single loud not-implemented stub.
 set -uo pipefail
 
 YT_PROG=yolotown
@@ -10,6 +17,12 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/config.sh
 . "$SELF_DIR/lib/config.sh" \
   || { printf 'yolotown: error: cannot source %s/lib/config.sh (broken install)\n' "$SELF_DIR" >&2; exit 1; }
+# shellcheck source=lib/rundir.sh
+. "$SELF_DIR/lib/rundir.sh" \
+  || { printf 'yolotown: error: cannot source %s/lib/rundir.sh (broken install)\n' "$SELF_DIR" >&2; exit 1; }
+# shellcheck source=lib/tasks.sh
+. "$SELF_DIR/lib/tasks.sh" \
+  || { printf 'yolotown: error: cannot source %s/lib/tasks.sh (broken install)\n' "$SELF_DIR" >&2; exit 1; }
 # shellcheck source=lib/report.sh
 . "$SELF_DIR/lib/report.sh" \
   || { printf 'yolotown: error: cannot source %s/lib/report.sh (broken install)\n' "$SELF_DIR" >&2; exit 1; }
@@ -20,14 +33,42 @@ usage() {
   cat >&2 <<'USAGE'
 usage: yolotown <command> [args]
 
-  status              per-task report table for the latest run (.yolotown/latest)
-
-Not yet implemented here (use ./seed.sh <name> "<desc>" for a single task):
-  plan | run | run-one | clean
+  plan [tasks.txt]           parse and list the backlog; a dry run, touches nothing
+  run  [tasks.txt]           dispatch every task serially, one run dir, continue past
+                             failures, then print the fan-in report
+  run-one <name> "<desc>"    single-task debugging path (via seed.sh)
+  status                     per-task report table for the latest run (.yolotown/latest)
+  clean [--force]            print worktree/branch removal commands; execute only with --force
 
 Run from anywhere inside the target repo (the one with .yolotown.conf).
+tasks.txt format, one per line: <short-name> | <description>  (# comments, blanks ok)
 USAGE
   exit 2
+}
+
+# _yt_repo_root — echo the repo toplevel, or die. Every command runs from the
+# repo root so config, .yolotown/, and worktree siblings resolve identically.
+_yt_repo_root() {
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git repository"
+  local toplevel
+  toplevel="$(git rev-parse --show-toplevel)" || die "cannot locate the repo root"
+  printf '%s\n' "$toplevel"
+}
+
+# _yt_resolve_tasks_file <toplevel> <argc> <arg1> — echo the absolute tasks
+# file path. With no argument it defaults to <toplevel>/tasks.txt; an explicit
+# relative path is resolved against the invocation cwd (before any cd), so
+# `yolotown run ./mine.txt` means what the caller sees, not the repo root.
+_yt_resolve_tasks_file() {
+  local toplevel="$1" argc="$2" arg="$3"
+  if [ "$argc" -ge 1 ]; then
+    case "$arg" in
+      /*) printf '%s\n' "$arg" ;;
+      *)  printf '%s\n' "$PWD/$arg" ;;
+    esac
+  else
+    printf '%s\n' "$toplevel/tasks.txt"
+  fi
 }
 
 # cmd_status — resolve .yolotown/latest under the repo root, load config for the
@@ -57,12 +98,351 @@ cmd_status() {
   yt_report "$run" "$BASE_BRANCH" "$BRANCH_PREFIX" "$(dirname "$toplevel")"
 }
 
+# cmd_plan [tasks.txt] — the dry run: parse the backlog and list the tasks that
+# `run` would dispatch, touching nothing on disk. Conflict-detection bucketing
+# (DISJOINT / COLLIDING-SPLITTABLE / INHERENTLY-COUPLED, per SPEC section 3.1)
+# is a Stage 3 feature; today plan proves the file parses and shows the work.
+cmd_plan() {
+  [ $# -le 1 ] || die "plan takes at most one argument (the tasks file); got: $*"
+  local toplevel; toplevel="$(_yt_repo_root)" || exit 1
+  local tasks_file; tasks_file="$(_yt_resolve_tasks_file "$toplevel" "$#" "${1:-}")"
+  cd "$toplevel" || die "cannot enter the repo root $toplevel"
+
+  [ -f "$tasks_file" ] || die "tasks file not found: $tasks_file
+create it, one task per line: <short-name> | <description>"
+
+  # yt_parse_tasks prints name<TAB>desc on success; on malformed input it prints
+  # line-numbered errors to stderr (passed straight through here) and returns 1.
+  local parsed rc
+  parsed="$(yt_parse_tasks "$tasks_file")"; rc=$?
+  [ "$rc" -eq 0 ] || die "tasks file has errors (see above); fix them and re-run"
+
+  printf 'plan: %s (dry run — nothing is written)\n\n' "$tasks_file"
+  local n=0 name desc
+  while IFS=$'\t' read -r name desc; do
+    [ -n "$name" ] || continue
+    n=$((n + 1))
+    printf '  %s | %s\n' "$name" "$desc"
+  done <<< "$parsed"
+  [ "$n" -gt 0 ] || die "no tasks found in $tasks_file (only comments/blank lines)"
+
+  printf '\n%d task%s would be dispatched by: yolotown run %s\n' \
+    "$n" "$([ "$n" -eq 1 ] && printf '' || printf 's')" "$tasks_file"
+  printf 'conflict detection (bucketing on the planner model) lands in Stage 3;\n'
+  printf 'today plan is a parse-and-list dry run that touches nothing.\n'
+}
+
+# ---- run: shared per-task worker --------------------------------------------
+# Set by cmd_run before iterating; the worker reads them as globals.
+RUN_DIR=""
+TOPLEVEL=""
+WORKTREE_PARENT=""
+INVARIANTS_CONTENT=""
+
+# _yt_task_fail <name> <log> <wt> <reason> — record a per-task failure and its
+# pointers WITHOUT exiting the run: mark running -> failed (silenced so a stray
+# status error never bleeds into the report) and note it in the task log. The
+# caller returns 1 right after so the run moves on to the next task.
+_yt_task_fail() {
+  local name="$1" log="$2" wt="$3" reason="$4"
+  yt_status_set "$RUN_DIR" "$name" failed >/dev/null 2>&1 || true
+  {
+    echo ""
+    echo "task $name: FAILED ($reason)"
+    echo "  log:      $log"
+    echo "  worktree: $wt"
+  } | tee -a "$log"
+}
+
+# yt_run_task <name> <desc> — dispatch one task into the shared run dir: cut a
+# worktree off BASE_BRANCH, seed env files, run the agent, gate, and on green
+# commit (+ push if PUSH_ON_GREEN). Mirrors seed.sh's core, but returns 0/1
+# instead of exiting so `run` continues past a failure. Status walks
+# pending -> running -> {passed|failed}; a failed task's worktree is left intact
+# for autopsy, exactly like the seed.
+yt_run_task() {
+  local name="$1" desc="$2"
+  local branch="${BRANCH_PREFIX}${name}"
+  local wt="$WORKTREE_PARENT/yt-${name}"
+  local log="$RUN_DIR/logs/${name}.log"
+  : > "$log"
+
+  # Attempted now: pending -> running. Every downstream failure is running ->
+  # failed, a legal edge; a preflight collision below is a failure, not a skip.
+  yt_status_set "$RUN_DIR" "$name" running >/dev/null 2>&1 || true
+  {
+    echo "run: task=$name branch=$branch"
+    echo "run: worktree=$wt"
+    echo "run: log=$log"
+  } | tee -a "$log"
+
+  # Preflight collisions: a leftover branch or worktree from a prior run. Fail
+  # this task loudly (naming the cleanup), keep going with the rest.
+  if git rev-parse --verify --quiet "refs/heads/$branch" >/dev/null; then
+    _yt_task_fail "$name" "$log" "$wt" "branch \"$branch\" already exists; cleanup: git branch -D $branch"
+    return 1
+  fi
+  if [ -e "$wt" ]; then
+    _yt_task_fail "$name" "$log" "$wt" "worktree \"$wt\" already exists; cleanup: git worktree remove --force $wt"
+    return 1
+  fi
+
+  git worktree add "$wt" -b "$branch" "$BASE_BRANCH" >>"$log" 2>&1 || {
+    _yt_task_fail "$name" "$log" "$wt" "git worktree add failed (see log)"
+    return 1
+  }
+
+  # Undo a seconds-old, workless worktree — allowed ONLY before the agent runs.
+  local f
+  for f in $ENV_FILES; do
+    mkdir -p "$wt/$(dirname "$f")"
+    cp "$f" "$wt/$f"
+    if ! git -C "$wt" check-ignore -q "$f"; then
+      git worktree remove --force "$wt" >/dev/null 2>&1 || true
+      git branch -D "$branch" >/dev/null 2>&1 || true
+      _yt_task_fail "$name" "$log" "$wt" "ENV_FILES entry \"$f\" is not git-ignored in the worktree; add it to .gitignore (fresh worktree removed)"
+      return 1
+    fi
+  done
+
+  local prompt
+  prompt="You are completing one software task inside an isolated git worktree.
+The current directory is the worktree; it is yours alone.
+
+TASK: ${name}
+DESCRIPTION: ${desc}
+
+ACCEPTANCE GATE: the command \`${TEST_CMD}\` must exit 0. Run it yourself
+before finishing. You are done only when it passes.
+
+RULES:
+- Never weaken, delete, or edit an existing test to make it pass. A red
+  gate means the work is wrong, not the test.
+- Do not run any git commands that commit, push, branch, or merge; the
+  orchestrator owns git. Read-only git (status, diff, log) is fine.
+- Work only inside the current directory.
+- If the description references spec files in the repo, read them first.
+
+REPOSITORY INVARIANTS (obey these):
+${INVARIANTS_CONTENT}"
+
+  # stdin from /dev/null: the agent is headless and must never inherit (and
+  # stall on) the run's stdin. seed.sh's own invocation is fixed separately.
+  local rc
+  echo "run: agent: $CLAUDE_BIN (model: ${WORKER_MODEL:-cli default})" | tee -a "$log"
+  (
+    cd "$wt" && "$CLAUDE_BIN" -p "$prompt" \
+      ${WORKER_MODEL:+--model "$WORKER_MODEL"} \
+      --allowedTools "Edit" "Write" "Read" "Glob" "Grep" "Bash" </dev/null
+  ) 2>&1 | tee -a "$log"
+  rc="${PIPESTATUS[0]}"
+  [ "$rc" -eq 0 ] || { _yt_task_fail "$name" "$log" "$wt" "agent exited nonzero ($rc)"; return 1; }
+
+  [ -n "$(git -C "$wt" status --porcelain)" ] || {
+    _yt_task_fail "$name" "$log" "$wt" "agent made no changes"; return 1;
+  }
+
+  echo "run: gate: $TEST_CMD" | tee -a "$log"
+  ( cd "$wt" && bash -c "$TEST_CMD" ) 2>&1 | tee -a "$log"
+  rc="${PIPESTATUS[0]}"
+  [ "$rc" -eq 0 ] || { _yt_task_fail "$name" "$log" "$wt" "gate red, exit $rc"; return 1; }
+
+  local subject body
+  subject="feat(${name}): $(printf '%s' "$desc" | cut -c1-60)"
+  body="Task: ${desc}
+
+Authored by yolotown run via headless claude agent."
+  git -C "$wt" add -A
+  git -C "$wt" commit -m "$subject" -m "$body" >>"$log" 2>&1 || {
+    _yt_task_fail "$name" "$log" "$wt" "git commit failed"; return 1;
+  }
+
+  if [ "$PUSH_ON_GREEN" = "true" ]; then
+    if ! git -C "$wt" push -u origin "$branch" >>"$log" 2>&1; then
+      _yt_task_fail "$name" "$log" "$wt" "push failed; commit stands on $branch, retry: git -C $wt push -u origin $branch"
+      return 1
+    fi
+  fi
+
+  yt_status_set "$RUN_DIR" "$name" passed >/dev/null 2>&1 || true
+  {
+    echo ""
+    echo "task $name: PASSED (branch $branch)"
+  } | tee -a "$log"
+  return 0
+}
+
+# cmd_run [tasks.txt] — the serial pipeline. Parse the backlog, refuse a dirty
+# or off-base or red baseline up front, create one run dir with every task
+# registered pending, dispatch them one at a time (continuing past failures),
+# then render the fan-in report. Exits nonzero if any task failed.
+cmd_run() {
+  [ $# -le 1 ] || die "run takes at most one argument (the tasks file); got: $*"
+  TOPLEVEL="$(_yt_repo_root)" || exit 1
+  local tasks_file; tasks_file="$(_yt_resolve_tasks_file "$TOPLEVEL" "$#" "${1:-}")"
+  cd "$TOPLEVEL" || die "cannot enter the repo root $TOPLEVEL"
+  WORKTREE_PARENT="$(dirname "$TOPLEVEL")"
+
+  yt_load_config
+
+  [ -f "$tasks_file" ] || die "tasks file not found: $tasks_file
+create it, one task per line: <short-name> | <description>"
+
+  # Parse first: never touch the tree if the backlog is malformed.
+  local parsed rc
+  parsed="$(yt_parse_tasks "$tasks_file")"; rc=$?
+  [ "$rc" -eq 0 ] || die "tasks file has errors (see above); fix them and re-run"
+
+  local -a names=() descs=()
+  local name desc
+  while IFS=$'\t' read -r name desc; do
+    [ -n "$name" ] || continue
+    names+=("$name"); descs+=("$desc")
+  done <<< "$parsed"
+  [ "${#names[@]}" -gt 0 ] || die "no tasks found in $tasks_file (only comments/blank lines)"
+
+  # Baseline preconditions (whole-run, not per-task): the tool never leaves the
+  # base branch red or modified, and never fans out on a red base suite.
+  if ! git rev-parse --verify --quiet "refs/heads/$BASE_BRANCH" >/dev/null; then
+    die "base branch \"$BASE_BRANCH\" does not exist; create it, then re-run"
+  fi
+  local current_branch
+  current_branch="$(git rev-parse --abbrev-ref HEAD)"
+  [ "$current_branch" = "$BASE_BRANCH" ] \
+    || die "checked out on \"$current_branch\", not base branch \"$BASE_BRANCH\"; the base gate must run against the base branch"
+  [ -z "$(git status --porcelain --untracked-files=no)" ] \
+    || die "base working tree is dirty; commit or stash before running"
+  local f
+  for f in $ENV_FILES; do
+    [ -f "$f" ] || die "ENV_FILES entry \"$f\" not found in repo root"
+  done
+
+  echo "run: base gate: $TEST_CMD"
+  bash -c "$TEST_CMD" || die "base suite is red; refusing to start (fix the base branch first)"
+
+  # Invariants file is config-level: read once, injected into every prompt.
+  if [ -n "$INVARIANTS_FILE" ]; then
+    INVARIANTS_CONTENT="$(cat "$INVARIANTS_FILE")"
+  else
+    INVARIANTS_CONTENT="None provided."
+  fi
+
+  # One run dir for the whole batch; every task registered up front, born
+  # pending, so the report accounts for tasks that never got to run too.
+  local run_ts ytdir
+  run_ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  ytdir="$TOPLEVEL/.yolotown"
+  RUN_DIR="$(yt_run_create "$ytdir" "$run_ts")" || die "could not create a run dir under $ytdir"
+  local i
+  for i in "${!names[@]}"; do
+    yt_status_init "$RUN_DIR" "${names[$i]}" || die "could not register task \"${names[$i]}\" in $RUN_DIR"
+  done
+
+  echo "run: ${#names[@]} task(s) into $RUN_DIR"
+  local failures=0
+  for i in "${!names[@]}"; do
+    printf '\n=== run: task %d/%d: %s\n' "$((i + 1))" "${#names[@]}" "${names[$i]}"
+    yt_run_task "${names[$i]}" "${descs[$i]}" || failures=$((failures + 1))
+  done
+
+  printf '\n'
+  yt_report "$RUN_DIR" "$BASE_BRANCH" "$BRANCH_PREFIX" "$WORKTREE_PARENT"
+
+  [ "$failures" -eq 0 ] || exit 1
+  exit 0
+}
+
+# cmd_run_one <name> "<desc>" — the single-task debugging path. Delegates to
+# seed.sh verbatim (exec preserves its exit code, output, and its own run dir),
+# so this stays exactly today's single-task behavior with no drift.
+cmd_run_one() {
+  [ $# -eq 2 ] || die "run-one needs exactly <name> \"<desc>\" (got $# argument(s))
+example: yolotown run-one add-rss \"Add an RSS feed endpoint\""
+  exec "$SELF_DIR/seed.sh" "$@"
+}
+
+# cmd_clean [--force] — from the latest run, print the removal commands for the
+# leftover worktrees/branches (the tasks that reached a worktree: passed or
+# failed). Without --force it only prints them; with --force it executes each,
+# best-effort. Never touches skipped/pending tasks (they never got a worktree),
+# never deletes remote branches (the run dir does not record what was pushed).
+cmd_clean() {
+  local force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      -h|--help) usage ;;
+      -*) die "clean: unknown option \"$1\" (the only option is --force)" ;;
+      *)  die "clean takes no positional arguments (got \"$1\"); did you mean --force?" ;;
+    esac
+  done
+
+  local toplevel; toplevel="$(_yt_repo_root)" || exit 1
+  cd "$toplevel" || die "cannot enter the repo root $toplevel"
+  yt_load_config
+
+  local ytdir="$toplevel/.yolotown" latest="$toplevel/.yolotown/latest"
+  [ -e "$latest" ] || die "no runs yet under $ytdir (nothing to clean)"
+  local run; run="$ytdir/$(readlink "$latest")"
+  [ -d "$run/status" ] || die "latest points at $run, which has no status/ directory (broken run dir)"
+
+  local wtparent; wtparent="$(dirname "$toplevel")"
+  printf 'clean: latest run %s%s\n\n' "$run" "$([ "$force" -eq 1 ] && printf ' (--force: executing)' || printf ' (dry run)')"
+
+  local -a names=()
+  local name
+  while IFS= read -r name; do
+    [ -n "$name" ] && names+=("$name")
+  done < <(ls -1 "$run/status" 2>/dev/null | LC_ALL=C sort)
+
+  local any=0 status wt branch
+  for name in "${names[@]}"; do
+    status="$(yt_status_get "$run" "$name" 2>/dev/null)" || continue
+    # Only passed/failed tasks ever got a worktree+branch; skipped/pending did
+    # not, and running is in-flight (leave it alone).
+    case "$status" in passed|failed) ;; *) continue ;; esac
+    wt="$wtparent/yt-$name"
+    branch="${BRANCH_PREFIX}${name}"
+    any=1
+    printf '  git worktree remove --force %s\n' "$wt"
+    printf '  git branch -D %s\n' "$branch"
+    if [ "$force" -eq 1 ]; then
+      # Worktree first: a branch checked out in a worktree cannot be deleted.
+      if [ -e "$wt" ]; then
+        git -C "$toplevel" worktree remove --force "$wt" >/dev/null 2>&1 \
+          && printf '    removed worktree %s\n' "$wt" \
+          || printf '    (worktree %s could not be removed; remove it by hand)\n' "$wt"
+      else
+        printf '    (worktree %s already gone)\n' "$wt"
+      fi
+      if git rev-parse --verify --quiet "refs/heads/$branch" >/dev/null; then
+        git -C "$toplevel" branch -D "$branch" >/dev/null 2>&1 \
+          && printf '    deleted branch %s\n' "$branch" \
+          || printf '    (branch %s could not be deleted; delete it by hand)\n' "$branch"
+      else
+        printf '    (branch %s already gone)\n' "$branch"
+      fi
+    fi
+  done
+
+  if [ "$any" -eq 0 ]; then
+    printf '  (nothing to clean: the latest run left no worktrees)\n'
+    return 0
+  fi
+  if [ "$force" -eq 0 ]; then
+    printf '\nre-run with --force to execute the commands above.\n'
+    printf 'remote feature branches are never deleted here; do that by hand once merged.\n'
+  fi
+}
+
 [ $# -ge 1 ] || usage
 cmd="$1"; shift
 case "$cmd" in
   status)              cmd_status "$@" ;;
-  plan|run|run-one|clean)
-    die "subcommand \"$cmd\" is not implemented yet (cli task). For a single task now: $SELF_DIR/seed.sh <name> \"<desc>\"" ;;
+  plan)                cmd_plan "$@" ;;
+  run)                 cmd_run "$@" ;;
+  run-one)             cmd_run_one "$@" ;;
+  clean)               cmd_clean "$@" ;;
   -h|--help|help)      usage ;;
   *)                   printf 'yolotown: error: unknown command "%s"\n' "$cmd" >&2; usage ;;
 esac
