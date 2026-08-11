@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# yolotown entrypoint. Subcommand dispatch; today it implements `status`, the
+# per-task fan-in report read from .yolotown/latest. The remaining subcommands
+# (plan, run, run-one, clean) are the `cli` task's scope and land next in the
+# Stage 1 backlog; until then they route you to the seed for single-task runs.
+set -uo pipefail
+
+YT_PROG=yolotown
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/config.sh
+. "$SELF_DIR/lib/config.sh" \
+  || { printf 'yolotown: error: cannot source %s/lib/config.sh (broken install)\n' "$SELF_DIR" >&2; exit 1; }
+# shellcheck source=lib/report.sh
+. "$SELF_DIR/lib/report.sh" \
+  || { printf 'yolotown: error: cannot source %s/lib/report.sh (broken install)\n' "$SELF_DIR" >&2; exit 1; }
+
+die() { printf 'yolotown: error: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: yolotown <command> [args]
+
+  status              per-task report table for the latest run (.yolotown/latest)
+
+Not yet implemented here (use ./seed.sh <name> "<desc>" for a single task):
+  plan | run | run-one | clean
+
+Run from anywhere inside the target repo (the one with .yolotown.conf).
+USAGE
+  exit 2
+}
+
+# cmd_status — resolve .yolotown/latest under the repo root, load config for the
+# branch/base names, and render the fan-in report. Fails loud if the tree has
+# no runs yet; never guesses.
+cmd_status() {
+  [ $# -eq 0 ] || die "status takes no arguments (got: $*)"
+
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git repository"
+  local toplevel
+  toplevel="$(git rev-parse --show-toplevel)" || die "cannot locate the repo root"
+  cd "$toplevel" || die "cannot enter the repo root $toplevel"
+
+  # Defaults + validation live in lib/config.sh; we need BASE_BRANCH and
+  # BRANCH_PREFIX to render branches and merge commands.
+  yt_load_config
+
+  local ytdir="$toplevel/.yolotown" latest="$toplevel/.yolotown/latest"
+  if [ ! -e "$latest" ]; then
+    die "no runs yet under $ytdir (nothing to report). Run a task first: $SELF_DIR/seed.sh <name> \"<desc>\""
+  fi
+
+  local run
+  run="$ytdir/$(readlink "$latest")"
+  [ -d "$run/status" ] || die "latest points at $run, which has no status/ directory (broken run dir)"
+
+  yt_report "$run" "$BASE_BRANCH" "$BRANCH_PREFIX" "$(dirname "$toplevel")"
+}
+
+[ $# -ge 1 ] || usage
+cmd="$1"; shift
+case "$cmd" in
+  status)              cmd_status "$@" ;;
+  plan|run|run-one|clean)
+    die "subcommand \"$cmd\" is not implemented yet (cli task). For a single task now: $SELF_DIR/seed.sh <name> \"<desc>\"" ;;
+  -h|--help|help)      usage ;;
+  *)                   printf 'yolotown: error: unknown command "%s"\n' "$cmd" >&2; usage ;;
+esac
