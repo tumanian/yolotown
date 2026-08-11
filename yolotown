@@ -26,6 +26,9 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/report.sh
 . "$SELF_DIR/lib/report.sh" \
   || { printf 'yolotown: error: cannot source %s/lib/report.sh (broken install)\n' "$SELF_DIR" >&2; exit 1; }
+# shellcheck source=lib/task.sh
+. "$SELF_DIR/lib/task.sh" \
+  || { printf 'yolotown: error: cannot source %s/lib/task.sh (broken install)\n' "$SELF_DIR" >&2; exit 1; }
 
 die() { printf 'yolotown: error: %s\n' "$*" >&2; exit 1; }
 
@@ -133,143 +136,45 @@ create it, one task per line: <short-name> | <description>"
 }
 
 # ---- run: shared per-task worker --------------------------------------------
-# Set by cmd_run before iterating; the worker reads them as globals.
+# Set by cmd_run before iterating; the shared core (lib/task.sh) reads
+# WORKTREE_PARENT and INVARIANTS_CONTENT as globals, and cmd_run passes RUN_DIR
+# in explicitly. TOPLEVEL is kept for cmd_run's own use.
 RUN_DIR=""
 TOPLEVEL=""
 WORKTREE_PARENT=""
 INVARIANTS_CONTENT=""
 
-# _yt_task_fail <name> <log> <wt> <reason> — record a per-task failure and its
-# pointers WITHOUT exiting the run: mark running -> failed (silenced so a stray
-# status error never bleeds into the report) and note it in the task log. The
-# caller returns 1 right after so the run moves on to the next task.
-_yt_task_fail() {
-  local name="$1" log="$2" wt="$3" reason="$4"
-  yt_status_set "$RUN_DIR" "$name" failed >/dev/null 2>&1 || true
+# _yt_run_report_task <name> <rc> — render the terse per-task line for the run
+# log and the live transcript, from the outcome yt_run_task left in the YT_TASK_*
+# globals. yt_run_task already drove the status machine; this only reports. rc
+# is nonzero for both a plain failure and a local-commit-but-push-failed (2):
+# for a batch either way the branch is not on origin, so both read as FAILED.
+_yt_run_report_task() {
+  local name="$1" rc="$2"
+  if [ "$rc" -eq 0 ]; then
+    {
+      echo ""
+      echo "task $name: PASSED (branch $YT_TASK_BRANCH)"
+    } | tee -a "$YT_TASK_LOG"
+    return 0
+  fi
   {
     echo ""
-    echo "task $name: FAILED ($reason)"
-    echo "  log:      $log"
-    echo "  worktree: $wt"
-  } | tee -a "$log"
+    echo "task $name: FAILED ($YT_TASK_REASON)"
+    echo "  log:      $YT_TASK_LOG"
+    echo "  worktree: $YT_TASK_WT"
+  } | tee -a "$YT_TASK_LOG"
+  return 1
 }
 
-# yt_run_task <name> <desc> — dispatch one task into the shared run dir: cut a
-# worktree off BASE_BRANCH, seed env files, run the agent, gate, and on green
-# commit (+ push if PUSH_ON_GREEN). Mirrors seed.sh's core, but returns 0/1
-# instead of exiting so `run` continues past a failure. Status walks
-# pending -> running -> {passed|failed}; a failed task's worktree is left intact
-# for autopsy, exactly like the seed.
-yt_run_task() {
-  local name="$1" desc="$2"
-  local branch="${BRANCH_PREFIX}${name}"
-  local wt="$WORKTREE_PARENT/yt-${name}"
-  local log="$RUN_DIR/logs/${name}.log"
-  : > "$log"
-
-  # Attempted now: pending -> running. Every downstream failure is running ->
-  # failed, a legal edge; a preflight collision below is a failure, not a skip.
-  yt_status_set "$RUN_DIR" "$name" running >/dev/null 2>&1 || true
-  {
-    echo "run: task=$name branch=$branch"
-    echo "run: worktree=$wt"
-    echo "run: log=$log"
-  } | tee -a "$log"
-
-  # Preflight collisions: a leftover branch or worktree from a prior run. Fail
-  # this task loudly (naming the cleanup), keep going with the rest.
-  if git rev-parse --verify --quiet "refs/heads/$branch" >/dev/null; then
-    _yt_task_fail "$name" "$log" "$wt" "branch \"$branch\" already exists; cleanup: git branch -D $branch"
-    return 1
-  fi
-  if [ -e "$wt" ]; then
-    _yt_task_fail "$name" "$log" "$wt" "worktree \"$wt\" already exists; cleanup: git worktree remove --force $wt"
-    return 1
-  fi
-
-  git worktree add "$wt" -b "$branch" "$BASE_BRANCH" >>"$log" 2>&1 || {
-    _yt_task_fail "$name" "$log" "$wt" "git worktree add failed (see log)"
-    return 1
-  }
-
-  # Undo a seconds-old, workless worktree — allowed ONLY before the agent runs.
-  local f
-  for f in $ENV_FILES; do
-    mkdir -p "$wt/$(dirname "$f")"
-    cp "$f" "$wt/$f"
-    if ! git -C "$wt" check-ignore -q "$f"; then
-      git worktree remove --force "$wt" >/dev/null 2>&1 || true
-      git branch -D "$branch" >/dev/null 2>&1 || true
-      _yt_task_fail "$name" "$log" "$wt" "ENV_FILES entry \"$f\" is not git-ignored in the worktree; add it to .gitignore (fresh worktree removed)"
-      return 1
-    fi
-  done
-
-  local prompt
-  prompt="You are completing one software task inside an isolated git worktree.
-The current directory is the worktree; it is yours alone.
-
-TASK: ${name}
-DESCRIPTION: ${desc}
-
-ACCEPTANCE GATE: the command \`${TEST_CMD}\` must exit 0. Run it yourself
-before finishing. You are done only when it passes.
-
-RULES:
-- Never weaken, delete, or edit an existing test to make it pass. A red
-  gate means the work is wrong, not the test.
-- Do not run any git commands that commit, push, branch, or merge; the
-  orchestrator owns git. Read-only git (status, diff, log) is fine.
-- Work only inside the current directory.
-- If the description references spec files in the repo, read them first.
-
-REPOSITORY INVARIANTS (obey these):
-${INVARIANTS_CONTENT}"
-
-  # stdin from /dev/null: the agent is headless and must never inherit (and
-  # stall on) the run's stdin. seed.sh's own invocation is fixed separately.
-  local rc
-  echo "run: agent: $CLAUDE_BIN (model: ${WORKER_MODEL:-cli default})" | tee -a "$log"
-  (
-    cd "$wt" && "$CLAUDE_BIN" -p "$prompt" \
-      ${WORKER_MODEL:+--model "$WORKER_MODEL"} \
-      --allowedTools "Edit" "Write" "Read" "Glob" "Grep" "Bash" </dev/null
-  ) 2>&1 | tee -a "$log"
-  rc="${PIPESTATUS[0]}"
-  [ "$rc" -eq 0 ] || { _yt_task_fail "$name" "$log" "$wt" "agent exited nonzero ($rc)"; return 1; }
-
-  [ -n "$(git -C "$wt" status --porcelain)" ] || {
-    _yt_task_fail "$name" "$log" "$wt" "agent made no changes"; return 1;
-  }
-
-  echo "run: gate: $TEST_CMD" | tee -a "$log"
-  ( cd "$wt" && bash -c "$TEST_CMD" ) 2>&1 | tee -a "$log"
-  rc="${PIPESTATUS[0]}"
-  [ "$rc" -eq 0 ] || { _yt_task_fail "$name" "$log" "$wt" "gate red, exit $rc"; return 1; }
-
-  local subject body
-  subject="feat(${name}): $(printf '%s' "$desc" | cut -c1-60)"
-  body="Task: ${desc}
-
-Authored by yolotown run via headless claude agent."
-  git -C "$wt" add -A
-  git -C "$wt" commit -m "$subject" -m "$body" >>"$log" 2>&1 || {
-    _yt_task_fail "$name" "$log" "$wt" "git commit failed"; return 1;
-  }
-
-  if [ "$PUSH_ON_GREEN" = "true" ]; then
-    if ! git -C "$wt" push -u origin "$branch" >>"$log" 2>&1; then
-      _yt_task_fail "$name" "$log" "$wt" "push failed; commit stands on $branch, retry: git -C $wt push -u origin $branch"
-      return 1
-    fi
-  fi
-
-  yt_status_set "$RUN_DIR" "$name" passed >/dev/null 2>&1 || true
-  {
-    echo ""
-    echo "task $name: PASSED (branch $branch)"
-  } | tee -a "$log"
-  return 0
+# _yt_run_one <name> <desc> — dispatch one task into the shared run dir via the
+# lib/task.sh core (which returns 0/1/2 rather than exiting so `run` continues
+# past a failure), then render its terse per-task line. Returns 0 on pass, 1 on
+# any failure. The core leaves a failed task's worktree intact for autopsy.
+_yt_run_one() {
+  local name="$1" desc="$2" rc
+  yt_run_task "$RUN_DIR" "$name" "$desc"; rc=$?
+  _yt_run_report_task "$name" "$rc"
 }
 
 # cmd_run [tasks.txt] — the serial pipeline. Parse the backlog, refuse a dirty
@@ -342,7 +247,7 @@ create it, one task per line: <short-name> | <description>"
   local failures=0
   for i in "${!names[@]}"; do
     printf '\n=== run: task %d/%d: %s\n' "$((i + 1))" "${#names[@]}" "${names[$i]}"
-    yt_run_task "${names[$i]}" "${descs[$i]}" || failures=$((failures + 1))
+    _yt_run_one "${names[$i]}" "${descs[$i]}" || failures=$((failures + 1))
   done
 
   printf '\n'
