@@ -195,7 +195,12 @@ $PARSE_OUT
 EOF
 # The next task to dispatch must be present by name, so an accidental
 # truncation of the backlog fails loudly rather than silently passing.
-assert_contains "$PARSE_OUT" "fan-out${TAB}" "repo tasks.txt still carries the final Stage 1 task"
+# A deliberate tripwire: the structural checks above catch a mangled backlog,
+# but not one silently truncated to a prefix. Naming the last task catches that.
+# It is expected to need updating when a stage's backlog turns over — that edit
+# is the point, because it forces a human to look at an emptied backlog rather
+# than let the suite stay green through it.
+assert_contains "$PARSE_OUT" "coupled-serial${TAB}" "repo tasks.txt still carries the final Stage 3 task"
 ok "repo tasks.txt is well-formed"
 
 echo "tasks: all cases passed"
