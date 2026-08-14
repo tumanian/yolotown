@@ -2,14 +2,17 @@
 # yolotown entrypoint: subcommand dispatch over the Stage 1 pipeline.
 #
 #   plan [tasks.txt]           parse + list the backlog; a dry run, touches nothing
-#   run  [tasks.txt]           dispatch every task serially, one shared run dir,
-#                              continuing past individual failures, then report
+#   run  [opts] [tasks.txt]    dispatch every task into one shared run dir, at most
+#                              MAX_PARALLEL at a time, continuing past individual
+#                              failures, then report
 #   run-one <name> "<desc>"    single-task path (delegates to seed.sh verbatim)
 #   status                     per-task report table for the latest run
 #   clean [--force]            print (and with --force execute) worktree/branch removal
 #
 # `status` is unchanged from the report task; `run`/`run-one`/`clean`/`plan`
-# replace what used to be a single loud not-implemented stub.
+# replace what used to be a single loud not-implemented stub. `run` fans out
+# through lib/fanout.sh; one worker at a time (MAX_PARALLEL=1, --parallel 1 or
+# --serial) keeps the original inline loop, which streams agent output live.
 set -uo pipefail
 
 YT_PROG=yolotown
@@ -29,6 +32,9 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/task.sh
 . "$SELF_DIR/lib/task.sh" \
   || { printf 'yolotown: error: cannot source %s/lib/task.sh (broken install)\n' "$SELF_DIR" >&2; exit 1; }
+# shellcheck source=lib/fanout.sh
+. "$SELF_DIR/lib/fanout.sh" \
+  || { printf 'yolotown: error: cannot source %s/lib/fanout.sh (broken install)\n' "$SELF_DIR" >&2; exit 1; }
 
 die() { printf 'yolotown: error: %s\n' "$*" >&2; exit 1; }
 
@@ -37,8 +43,11 @@ usage() {
 usage: yolotown <command> [args]
 
   plan [tasks.txt]           parse and list the backlog; a dry run, touches nothing
-  run  [tasks.txt]           dispatch every task serially, one run dir, continue past
-                             failures, then print the fan-in report
+  run [opts] [tasks.txt]     dispatch every task, one run dir, continue past failures,
+                             then print the fan-in report. Options:
+                               --parallel N   at most N workers at once (default:
+                                              MAX_PARALLEL from .yolotown.conf, 3)
+                               --serial       one task at a time, output streamed live
   run-one <name> "<desc>"    single-task debugging path (via seed.sh)
   status                     per-task report table for the latest run (.yolotown/latest)
   clean [--force]            print worktree/branch removal commands; execute only with --force
@@ -177,18 +186,54 @@ _yt_run_one() {
   _yt_run_report_task "$name" "$rc"
 }
 
-# cmd_run [tasks.txt] — the serial pipeline. Parse the backlog, refuse a dirty
-# or off-base or red baseline up front, create one run dir with every task
-# registered pending, dispatch them one at a time (continuing past failures),
-# then render the fan-in report. Exits nonzero if any task failed.
+# cmd_run [--parallel N | --serial] [tasks.txt] — the batch pipeline. Parse the
+# backlog, refuse a dirty or off-base or red baseline up front, create one run
+# dir with every task registered pending, dispatch them at most N at a time
+# (continuing past failures), then render the fan-in report. Exits nonzero if
+# any task failed.
+#
+# N comes from MAX_PARALLEL unless --parallel/--serial overrides it. N=1 keeps
+# the inline serial loop rather than fanning out to a single worker: same work,
+# but the agent's output streams to the terminal instead of only to the log,
+# which is what makes --serial useful as the debugging fallback.
 cmd_run() {
-  [ $# -le 1 ] || die "run takes at most one argument (the tasks file); got: $*"
+  local par_override="" tasks_arg="" have_tasks=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --serial)     par_override=1; shift ;;
+      --parallel)
+        [ $# -ge 2 ] || die "run: --parallel needs a worker count
+example: yolotown run --parallel 4 tasks.txt"
+        par_override="$2"; shift 2 ;;
+      --parallel=*)
+        par_override="${1#--parallel=}"
+        [ -n "$par_override" ] || die "run: --parallel needs a worker count
+example: yolotown run --parallel 4 tasks.txt"
+        shift ;;
+      -h|--help)    usage ;;
+      -*)           die "run: unknown option \"$1\" (options: --parallel N, --serial)" ;;
+      *)
+        [ "$have_tasks" -eq 0 ] \
+          || die "run takes at most one tasks file (got \"$tasks_arg\" and \"$1\")"
+        tasks_arg="$1"; have_tasks=1; shift ;;
+    esac
+  done
+  if [ -n "$par_override" ]; then
+    case "$par_override" in
+      *[!0-9]*) die "run: --parallel must be a positive integer (got \"$par_override\")
+example: yolotown run --parallel 4 tasks.txt" ;;
+    esac
+    [ "$par_override" -ge 1 ] || die "run: --parallel must be at least 1 (got \"$par_override\")
+use --serial to run one task at a time"
+  fi
+
   TOPLEVEL="$(_yt_repo_root)" || exit 1
-  local tasks_file; tasks_file="$(_yt_resolve_tasks_file "$TOPLEVEL" "$#" "${1:-}")"
+  local tasks_file; tasks_file="$(_yt_resolve_tasks_file "$TOPLEVEL" "$have_tasks" "$tasks_arg")"
   cd "$TOPLEVEL" || die "cannot enter the repo root $TOPLEVEL"
   WORKTREE_PARENT="$(dirname "$TOPLEVEL")"
 
   yt_load_config
+  local parallel="${par_override:-$MAX_PARALLEL}"
 
   [ -f "$tasks_file" ] || die "tasks file not found: $tasks_file
 create it, one task per line: <short-name> | <description>"
@@ -248,12 +293,26 @@ create it, one task per line: <short-name> | <description>"
     yt_status_init "$RUN_DIR" "${names[$i]}" || die "could not register task \"${names[$i]}\" in $RUN_DIR"
   done
 
-  echo "run: ${#names[@]} task(s) into $RUN_DIR"
+  # Never spin up more workers than there is work for them to do.
+  [ "$parallel" -le "${#names[@]}" ] || parallel="${#names[@]}"
+
   local failures=0
-  for i in "${!names[@]}"; do
-    printf '\n=== run: task %d/%d: %s\n' "$((i + 1))" "${#names[@]}" "${names[$i]}"
-    _yt_run_one "${names[$i]}" "${descs[$i]}" || failures=$((failures + 1))
-  done
+  if [ "$parallel" -le 1 ]; then
+    echo "run: ${#names[@]} task(s) into $RUN_DIR (serial: one at a time)"
+    for i in "${!names[@]}"; do
+      printf '\n=== run: task %d/%d: %s\n' "$((i + 1))" "${#names[@]}" "${names[$i]}"
+      _yt_run_one "${names[$i]}" "${descs[$i]}" || failures=$((failures + 1))
+    done
+  else
+    echo "run: ${#names[@]} task(s) into $RUN_DIR (parallel: up to $parallel workers)"
+    echo "run: worker output goes to $RUN_DIR/logs/<task>.log (not the terminal); --serial streams it live"
+    local -a pairs=()
+    for i in "${!names[@]}"; do
+      pairs+=("${names[$i]}" "${descs[$i]}")
+    done
+    # 0 = every task passed; the fan-in report below has the per-task detail.
+    yt_fanout "$RUN_DIR" "$parallel" "${pairs[@]}" || failures=1
+  fi
 
   printf '\n'
   yt_report "$RUN_DIR" "$BASE_BRANCH" "$BRANCH_PREFIX" "$WORKTREE_PARENT"

@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # yolotown run directories: each run gets a flat-file home under .yolotown/,
 # named by the UTC time it was created. State inside a run is per task, not
-# per run: status/<task> holds a single-word status and logs/<task>.log holds
-# that task's log. A `latest` symlink always points at the newest run.
+# per run: status/<task> holds a single-word status, logs/<task>.log holds
+# that task's log, and results/<task> holds the outcome record a finished
+# worker leaves behind. A `latest` symlink always points at the newest run.
 #
 # Sourcing this file only defines functions; call yt_run_create to make a run,
-# yt_status_init to register a task in it (born pending), and yt_status_get /
-# yt_status_set to drive that task's state machine.
+# yt_status_init to register a task in it (born pending), yt_status_get /
+# yt_status_set to drive that task's state machine, and yt_result_set /
+# yt_result_get for the outcome record.
 #
 # Status state machine — every task is born "pending" and moves through exactly
 # the edges below; every other transition (including a no-op same-state set) is
@@ -78,8 +80,10 @@ _yt_task_file() {
 }
 
 # yt_run_create <yolotown-dir> [timestamp]
-#   Make <yolotown-dir>/run-<ts>/ with empty status/ and logs/ subdirs, repoint
-#   <yolotown-dir>/latest at it, and print the run dir path. No task status is
+#   Make <yolotown-dir>/run-<ts>/ with empty status/, logs/ and results/
+#   subdirs, repoint <yolotown-dir>/latest at it, and print the run dir path.
+#   All three are created up front so the run dir's shape is the same whether
+#   its tasks ran serially or fanned out. No task status is
 #   seeded here — a run holds many tasks, each registered later via
 #   yt_status_init. <ts> defaults to the current UTC time (YYYYMMDDTHHMMSSZ). A
 #   same-<ts> collision gets a -2, -3, ... suffix, so a run dir is never reused.
@@ -97,8 +101,8 @@ yt_run_create() {
     dir="$ytdir/$base"
   done
   mkdir "$dir" || { _yt_run_die "cannot create run dir $dir"; return 1; }
-  mkdir "$dir/status" "$dir/logs" \
-    || { _yt_run_die "cannot create status/ and logs/ under $dir"; return 1; }
+  mkdir "$dir/status" "$dir/logs" "$dir/results" \
+    || { _yt_run_die "cannot create status/, logs/ and results/ under $dir"; return 1; }
 
   # Relative symlink so .yolotown/ stays relocatable; -n so an existing
   # latest -> dir symlink is replaced, not descended into; -f to overwrite.
@@ -154,4 +158,79 @@ yt_status_set() {
     return 1
   fi
   printf '%s\n' "$to" > "$f"
+}
+
+# ---- per-task result records -------------------------------------------------
+# status/<task> answers "what state is this task in"; results/<task> answers
+# "what did its worker actually report". The status word is enough for a serial
+# run, where the caller keeps the outcome in its own shell variables. A fanned
+# out worker runs in a subshell and cannot hand variables back to the parent, so
+# it leaves the outcome here instead — two key=value lines, greppable and
+# cat-able like everything else in a run dir:
+#
+#     rc=1
+#     reason=agent exited nonzero (1)
+#
+# rc is the task's exit code (0 passed, nonzero failed) and reason is a
+# single-line human explanation, empty on success. The record's ABSENCE is
+# itself a signal: a worker that was killed never wrote one, which is how the
+# fan-out reaper tells "failed" from "died" (see lib/fanout.sh).
+
+# _yt_result_file <run-dir> <task> — print the path to <task>'s result file,
+#   validating the run dir (must have results/) and the task name, exactly as
+#   _yt_task_file does for status/. Does NOT require the file to exist.
+_yt_result_file() {
+  local dir="$1" task="$2"
+  if [ -z "$dir" ] || [ ! -d "$dir/results" ]; then
+    _yt_run_die "no run dir with a results/ directory at ${dir:-<unset>}/results"
+    return 1
+  fi
+  if [ -z "$task" ]; then
+    _yt_run_die "no task name given"
+    return 1
+  fi
+  case "$task" in
+    */*|.|..) _yt_run_die "invalid task name \"$task\" (must not contain \"/\")"; return 1 ;;
+  esac
+  printf '%s\n' "$dir/results/$task"
+}
+
+# yt_result_set <run-dir> <task> <rc> [reason]
+#   Record <task>'s outcome. <rc> must be a non-negative integer; <reason> is
+#   flattened to one line (newlines and tabs become spaces) so the record stays
+#   two lines exactly. Overwrites any earlier record for the task: the last
+#   word on a task is the one that counts.
+yt_result_set() {
+  local dir="$1" task="$2" rc="$3" reason="${4:-}" f
+  f="$(_yt_result_file "$dir" "$task")" || return 1
+  case "$rc" in
+    ""|*[!0-9]*) _yt_run_die "yt_result_set: rc must be a non-negative integer (got \"$rc\") for task \"$task\""; return 1 ;;
+  esac
+  reason="$(printf '%s' "$reason" | tr '\n\t' '  ')"
+  printf 'rc=%s\nreason=%s\n' "$rc" "$reason" > "$f" \
+    || { _yt_run_die "cannot write result for task \"$task\" in $dir"; return 1; }
+}
+
+# yt_result_get <run-dir> <task>
+#   Load <task>'s result into YT_RESULT_RC and YT_RESULT_REASON and return 0.
+#   Returns 1 with NO message when the task has no record — absence is an
+#   expected answer here (an unfinished or killed worker), not an error — and
+#   leaves the two globals empty so a caller cannot read a stale outcome.
+yt_result_get() {
+  local dir="$1" task="$2" f line
+  YT_RESULT_RC=""
+  YT_RESULT_REASON=""
+  f="$(_yt_result_file "$dir" "$task" 2>/dev/null)" || return 1
+  [ -f "$f" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      rc=*)     YT_RESULT_RC="${line#rc=}" ;;
+      reason=*) YT_RESULT_REASON="${line#reason=}" ;;
+    esac
+  done < "$f"
+  # A record without a usable rc is a corrupt record, not a result.
+  case "$YT_RESULT_RC" in
+    ""|*[!0-9]*) YT_RESULT_RC=""; YT_RESULT_REASON=""; return 1 ;;
+  esac
+  return 0
 }

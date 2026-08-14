@@ -7,11 +7,13 @@ agents in isolated git worktrees, each gated by the target repo's own tests.
 Green branches get committed and optionally pushed. The tool's contract ends
 at "green branch exists" — it never merges to your base branch.
 
-**Current state: Stage 0 (the seed).** `seed.sh` runs exactly one task
-through one agent in one worktree. The staged roadmap (serial self-build →
-parallel fan-out → conflict detection and the gated refactor stage) is built
-*by* the seed, task by task, gated by this repo's own test suite. See
-[DESIGN.md](DESIGN.md) for the approved seed design.
+**Current state: Stage 1 (self-build).** `seed.sh` still runs exactly one task
+through one agent in one worktree; the `yolotown` entrypoint wraps that core in
+a backlog pipeline that fans tasks out to bounded parallel workers. What's left
+of the roadmap (conflict detection and the gated refactor stage) is built *by*
+the tool, task by task, gated by this repo's own test suite. See
+[DESIGN.md](DESIGN.md) for the approved seed design and [SPEC.md](SPEC.md) for
+the whole plan.
 
 ## Requirements
 
@@ -54,6 +56,45 @@ and point you at the log. Full agent output lands in
 The seed never merges, never deletes your work, and refuses to start on a
 dirty or red base.
 
+## Running a backlog
+
+Write the tasks one per line in `tasks.txt` as `<short-name> | <description>`
+(`#` comments and blank lines are fine), then:
+
+```sh
+/path/to/yolotown/yolotown plan            # parse and list; touches nothing
+/path/to/yolotown/yolotown run             # dispatch the backlog
+/path/to/yolotown/yolotown status          # the latest run's table again
+/path/to/yolotown/yolotown clean --force   # remove the leftover worktrees
+```
+
+`run` checks the base once (clean, on `BASE_BRANCH`, green suite, agent
+reachable), then gives each task its own worktree, branch, log and gate. A
+failed task dies alone: the run continues, and the fan-in report at the end
+lists every task with its log, its worktree, and a ready-to-run merge command
+for each green branch.
+
+Tasks run **at most `MAX_PARALLEL` at a time** (default 3, because rate limits
+are real). A freed slot is refilled immediately, so N workers stay busy until
+the backlog runs out:
+
+```sh
+yolotown run --parallel 6 tasks.txt   # override MAX_PARALLEL for this run
+yolotown run --serial tasks.txt       # one at a time, agent output streamed live
+```
+
+Parallel workers write to `.yolotown/run-<ts>/logs/<task>.log` rather than the
+terminal — N agents talking at once is noise — and the terminal gets one line
+per dispatch and per completion. `--serial` is the debugging fallback: same
+pipeline, one task at a time, output live. Inside a run dir, `status/<task>`
+holds the state word and `results/<task>` holds the finished worker's exit code
+and reason, so a run is inspectable with `cat` while it is still in flight.
+
+Only the tasks are parallel, never the git plumbing that isn't safe to share:
+worktree creation is serialized behind `.yolotown/worktree.lock`, since
+concurrent `git worktree add` invocations trip over each other's half-written
+metadata.
+
 If `BASE_BRANCH` (default `main`) doesn't exist yet, the seed asks for
 confirmation before creating it at the tip of your current `HEAD`. If the
 repo has no commits at all, there's nothing to point a branch at — make an
@@ -71,11 +112,12 @@ Plain shell-sourceable `key=value` at the target repo root.
 | `BASE_BRANCH` | `main` | branch worktrees are cut from |
 | `BRANCH_PREFIX` | `feature/` | prefix for task branches |
 | `PUSH_ON_GREEN` | `true` | `false` = commit locally, don't push |
+| `MAX_PARALLEL` | `3` | workers `yolotown run` keeps in flight at once |
 | `WORKER_MODEL` | CLI default | model for task execution |
 | `CLAUDE_BIN` | `claude` | agent binary; also the test seam |
 
-Keys used by later stages (`MAX_PARALLEL`, `SOURCE_GLOBS`, `PLANNER_MODEL`)
-are accepted and ignored by the seed.
+Keys used by later stages (`SOURCE_GLOBS`, `PLANNER_MODEL`) are accepted and
+ignored for now.
 
 ## Testing
 
@@ -100,9 +142,12 @@ filesystem origin; the agent is a shim (`tests/fake-claude`) selected via
 - `ENV_FILES` are copied into worktrees and verified git-ignored there; a
   file that would be committed aborts the run.
 
-## Known limitations (Stage 0)
+## Known limitations
 
-- No agent timeout: a hung agent hangs the run (Ctrl-C is safe; worktrees
-  are never auto-deleted once an agent has run).
+- No agent timeout: a hung agent holds its worker slot for as long as it
+  hangs (Ctrl-C is safe; worktrees are never auto-deleted once an agent has
+  run).
 - No resumability of interrupted runs.
-- One task per invocation; the task-list pipeline arrives in Stage 1.
+- No conflict detection yet: `plan` only parses and lists, and `run` assumes
+  you wrote the backlog so its tasks don't collide. Bucketing and the gated
+  refactor stage are Stage 3.
