@@ -18,7 +18,6 @@
 #
 # DONE: config-loader (ebb6522), tasks-parser (fd212c3), run-dir (2a913ec),
 #       rundir-per-task (43d0f80), report (504743d), cli (7c8d32b),
-#       task-core (e767c40).
+#       task-core (e767c40), agent-stdin (a2ee297).
 
-agent-stdin | Ship the regression test that proves the headless agent is invoked with stdin redirected. The fix itself is ALREADY DONE: task-core unified both call sites on a single yt_run_task in lib/task.sh whose agent invocation passes </dev/null, so do not re-apply it — verify that first and say so. What is missing is a test locking it in, and the reason it is missing is subtle: tests/helpers.sh run_seed already redirects stdin from /dev/null, so the mocked suite cannot observe the difference and a naively written test would pass while proving nothing. Write a test that invokes the seed with stdin connected to a PIPE CARRYING DATA and has tests/fake-claude record whether it could read that data; with the redirect the shim must see EOF, without it the shim sees the data. Prove the test has teeth by confirming it fails when </dev/null is removed from lib/task.sh.
 fan-out | Implement bounded parallel workers via subshells honoring MAX_PARALLEL (with a --parallel N override and a --serial fallback), per-worker status files via lib/rundir.sh, and crash containment (one worker's crash never kills the run), followed by the fan-in report. See SPEC.md section 3.3. Tests must prove the concurrency bound using shim sleeps. Ship with tests.
