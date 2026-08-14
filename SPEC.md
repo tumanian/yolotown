@@ -264,6 +264,16 @@ scheduled for correction or explicitly accepted.
 - **`.yolotown/logs/<name>-<ts>.log` retained** as a symlink into the run dir
   for discoverability. Not in the spec's layout; harmless, revisit when `clean`
   learns to prune old runs.
+- **The run dir carries two files section 2 does not list** (introduced with
+  the `fan-out` task). `results/<task>` holds a finished worker's exit code and
+  failure reason: a worker is a subshell and cannot hand variables back to the
+  parent, so it reports through the run dir like everything else, and the
+  ABSENCE of the record is how the reaper tells a failed task from a killed
+  worker. `.yolotown/worktree.lock` is the directory-mutex that serializes
+  `git worktree add`, which is not safe to run concurrently against one repo
+  (it walks `.git/worktrees/*` and reads siblings another add is still
+  writing). Both stay inside the "writes only to `.yolotown/`" rule and stay
+  `cat`-able; neither changes the status state machine.
 - **`plan` is a placeholder** (introduced with the `cli` task). Spec §2 defines
   `plan` as conflict detection that prints DISJOINT / COLLIDING-SPLITTABLE /
   INHERENTLY-COUPLED buckets. Today it only parses `tasks.txt` and lists the

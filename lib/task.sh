@@ -87,6 +87,54 @@ yt_agent_precheck() {
   return 1
 }
 
+# ---- the worktree-creation lock ---------------------------------------------
+# `git worktree add` is NOT safe to run concurrently against one repo. Adding a
+# worktree walks .git/worktrees/* to validate the existing ones, so it reads a
+# sibling that another `add` is still writing and dies:
+#
+#   fatal: failed to read .git/worktrees/yt-other/commondir: Undefined error: 0
+#
+# Observed for real at 8 workers: roughly one task in eight lost its worktree
+# this way, for no reason of its own. So the creation step — and the removal in
+# the ENV_FILES cleanup path, which mutates the same directory — is serialized
+# across workers. It costs nothing: an add takes milliseconds, while the agent
+# and the gate (which stay fully parallel) take minutes.
+#
+# The lock is a directory, because mkdir is atomic everywhere; it lives at
+# .yolotown/worktree.lock, so the tool still writes only where it is allowed to
+# and the lock is visible with `ls` like all other state. The holder writes its
+# pid inside. A waiter that finds a lock held by a DEAD pid takes it over —
+# otherwise one SIGKILLed worker would poison every later task in the run,
+# which is exactly the contagion fan-out is supposed to prevent. Takeover is
+# by rename, so only one waiter can ever win it, and it never fires on a
+# pid-less lock (the instant between mkdir and the pid write).
+
+: "${YT_WT_LOCK_POLL:=0.05}"
+: "${YT_WT_LOCK_TIMEOUT_TICKS:=1200}"   # 1200 * 0.05s = 60s
+
+# _yt_wt_lock <lock-dir> — acquire, or return 1 after the timeout.
+_yt_wt_lock() {
+  local lock="$1" waited=0 holder stale
+  while ! mkdir "$lock" 2>/dev/null; do
+    holder="$(cat "$lock/pid" 2>/dev/null)"
+    if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+      stale="$lock.stale.$$"
+      if mv "$lock" "$stale" 2>/dev/null; then
+        rm -rf "$stale"
+        continue
+      fi
+    fi
+    sleep "$YT_WT_LOCK_POLL"
+    waited=$((waited + 1))
+    [ "$waited" -lt "$YT_WT_LOCK_TIMEOUT_TICKS" ] || return 1
+  done
+  printf '%s\n' "$$" > "$lock/pid" 2>/dev/null
+  return 0
+}
+
+# _yt_wt_unlock <lock-dir> — release a lock this process holds.
+_yt_wt_unlock() { rm -rf "$1"; }
+
 # _yt_task_fail <run-dir> <name> <reason> — record a per-task failure: mark
 # running -> failed (silenced) and stash the reason for the caller's report.
 # It does not print or touch the worktree; the caller owns the human-facing
@@ -98,10 +146,13 @@ _yt_task_fail() {
 }
 
 yt_run_task() {
-  local run="$1" name="$2" desc="$3"
+  local run="$1" name="$2" desc="$3" rc
   local branch="${BRANCH_PREFIX}${name}"
   local wt="$WORKTREE_PARENT/yt-${name}"
   local log="$run/logs/${name}.log"
+  # One lock per repo, not per run: a run dir always sits directly under
+  # .yolotown/, so sibling runs contend for the same .git/worktrees too.
+  local wtlock; wtlock="$(dirname "$run")/worktree.lock"
   : > "$log"
 
   # Publish the pointers up front so the caller can report them even on an
@@ -131,7 +182,14 @@ yt_run_task() {
     return 1
   fi
 
-  git worktree add "$wt" -b "$branch" "$BASE_BRANCH" >>"$log" 2>&1 || {
+  if ! _yt_wt_lock "$wtlock"; then
+    _yt_task_fail "$run" "$name" "timed out waiting for the worktree lock $wtlock; if no yolotown run is in flight, remove it: rm -rf $wtlock"
+    return 1
+  fi
+  git worktree add "$wt" -b "$branch" "$BASE_BRANCH" >>"$log" 2>&1
+  rc=$?
+  _yt_wt_unlock "$wtlock"
+  [ "$rc" -eq 0 ] || {
     _yt_task_fail "$run" "$name" "git worktree add failed (see log)"
     return 1
   }
@@ -143,8 +201,11 @@ yt_run_task() {
     mkdir -p "$wt/$(dirname "$f")"
     cp "$f" "$wt/$f"
     if ! git -C "$wt" check-ignore -q "$f"; then
+      # Removal walks .git/worktrees too, so it takes the same lock as add.
+      _yt_wt_lock "$wtlock"
       git worktree remove --force "$wt" >/dev/null 2>&1 || true
       git branch -D "$branch" >/dev/null 2>&1 || true
+      _yt_wt_unlock "$wtlock"
       _yt_task_fail "$run" "$name" "ENV_FILES entry \"$f\" is not git-ignored in the worktree; add it to .gitignore (fresh worktree removed)"
       return 1
     fi
@@ -175,7 +236,6 @@ ${INVARIANTS_CONTENT}"
   # stall on) the caller's stdin. This is the one place stdin is wired, so the
   # two former copies — one of which omitted it and stalled ~3s per dispatch —
   # can no longer diverge.
-  local rc
   echo "run: agent: $CLAUDE_BIN (model: ${WORKER_MODEL:-cli default})" | tee -a "$log"
   (
     cd "$wt" && "$CLAUDE_BIN" -p "$prompt" \
