@@ -9,6 +9,19 @@ if [ -n "${FAKE_CLAUDE_ARGV_FILE:-}" ]; then
   printf '%s\n' "$@" > "$FAKE_CLAUDE_ARGV_FILE"
 fi
 
+# Record what the agent's stdin looked like, when FAKE_CLAUDE_STDIN_FILE is set.
+# The core runs the agent with </dev/null, so this is an instant EOF; without
+# that redirect the agent inherits the caller's stdin and can read whatever it
+# carries. read -t bounds the wait so a live-but-empty stdin can never hang the
+# shim; a data-bearing pipe is read the moment its first line lands.
+if [ -n "${FAKE_CLAUDE_STDIN_FILE:-}" ]; then
+  if IFS= read -r -t 5 _line; then
+    printf 'stdin: %s\n' "$_line" > "$FAKE_CLAUDE_STDIN_FILE"
+  else
+    printf 'stdin: <eof>\n' > "$FAKE_CLAUDE_STDIN_FILE"
+  fi
+fi
+
 case "${FAKE_CLAUDE_MODE:-good}" in
   good)
     mkdir -p src
