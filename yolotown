@@ -222,6 +222,11 @@ create it, one task per line: <short-name> | <description>"
     [ -f "$f" ] || die "ENV_FILES entry \"$f\" not found in repo root"
   done
 
+  # One agent probe for the WHOLE batch (lib/task.sh), before the run dir and
+  # any worktree exists: an unreachable agent must cost one refusal, not one
+  # wasted invocation and one orphaned worktree per task in the backlog.
+  yt_agent_precheck || exit 1
+
   echo "run: base gate: $TEST_CMD"
   bash -c "$TEST_CMD" || die "base suite is red; refusing to start (fix the base branch first)"
 

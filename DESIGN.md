@@ -134,7 +134,9 @@ Mock exactly one thing: the agent, via `CLAUDE_BIN` → `tests/fake-claude`.
 - **Shim**: records full argv to `$FAKE_CLAUDE_ARGV_FILE` (prompt/flag
   assertions). Modes: `good` (adds valid `src/feature.js`, exit 0), `bad`
   (breaks `src/app.js`, exit 0), `noop` (no changes, exit 0), `crash`
-  (stderr noise, exit 1).
+  (stderr noise, exit 1). A reachability probe (marker in its prompt) is
+  answered separately by `FAKE_CLAUDE_PROBE_MODE` (`ok` default,
+  `unreachable`) and returns before the argv/stdin recording.
 - **Core assertions** per file: green path (exactly one commit, right
   subject/body, pushed tip matches origin, log captured, exit 0; plus a
   `PUSH_ON_GREEN=false` + `WORKER_MODEL` case), red path (no commit, origin
@@ -142,6 +144,8 @@ Mock exactly one thing: the agent, via `CLAUDE_BIN` → `tests/fake-claude`.
   (present in worktree, absent from `git ls-files` and the pushed tree),
   crash + noop (FAILED with right reason, orchestrator completes its report),
   fail-fast (one subcase per refusal, each asserting exit code + message),
+  agent precheck (reachable agent proceeds; unreachable one refuses both entry
+  paths with nothing created and the fix named; exactly one probe per batch),
   live smoke (real CLI, trivial task, only test that costs tokens).
 
 ## Piece 4 — Worktree lifecycle and failure modes
@@ -162,6 +166,7 @@ git push origin --delete <BRANCH_PREFIX><name>    # only if pushed
 |---|---|---|---|
 | bad args / bad config | preflight | never created | 2 |
 | dirty base / red base / not on base branch | preflight | never created | 1 |
+| agent unreachable (reachability probe) | preflight | never created | 1 |
 | branch or worktree path collision | preflight | untouched | 1 |
 | env file missing or not git-ignored | pre-agent | auto-removed | 1 |
 | agent exits nonzero | agent | intact | 1 |
@@ -172,6 +177,25 @@ git push origin --delete <BRANCH_PREFIX><name>    # only if pushed
 
 Out of seed scope, recorded so Stage 1+ picks them up: `git worktree prune`,
 resumability, agent timeout, lane checking.
+
+**Agent reachability probe (added 2026-08-14).** `yt_agent_precheck`
+(`lib/task.sh`, beside the per-task core so `seed.sh` and `yolotown run` share
+one copy) runs `CLAUDE_BIN` once per *invocation* — never per task — with a
+trivial prompt and `</dev/null`, before the run dir or any worktree exists. A
+nonzero exit refuses the whole run, printing the binary, the probe's own
+output, the likely cause (expired or missing claude CLI session) and the fix
+(`claude logout && claude login`). Motivation, observed for real: an expired
+OAuth session made every task fail identically, each one burning an agent
+invocation and orphaning a worktree — 50 tasks, 50 of each, one root cause.
+It runs after the local git preflight and before the base gate, so an
+unreachable agent is not paid for with a full suite run.
+
+The probe prompt carries the marker `yolotown-agent-reachability-probe` so
+`tests/fake-claude` can recognize it and answer from `FAKE_CLAUDE_PROBE_MODE`
+(`ok` | `unreachable`, default `ok`). That second seam is deliberate:
+`FAKE_CLAUDE_MODE` keeps meaning "how the *task* agent behaves", so
+`FAKE_CLAUDE_MODE=crash` still reaches worktree creation and a FAILED task
+with the worktree intact, exactly as `crash.test.sh` requires.
 
 ## Addendum — setup.sh (added 2026-07-20)
 
