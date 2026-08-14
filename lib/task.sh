@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# yolotown per-task execution core — the ONE implementation of the pipeline that
+# yolotown per-task execution core (plus the one whole-invocation agent
+# preflight that belongs beside it) — the ONE implementation of the pipeline that
 # turns a single (name, description) into a gated feature branch inside its own
 # worktree: cut a worktree off BASE_BRANCH, seed and verify ENV_FILES, build the
 # worker prompt, run the headless agent, gate on TEST_CMD, and on green commit
@@ -34,6 +35,57 @@
 #     outcome, and every failure here is the legal running -> failed edge.
 
 : "${YT_PROG:=yolotown}"
+
+# ---- invocation-level preflight ---------------------------------------------
+# One agent reachability probe per INVOCATION — never per task. An expired or
+# missing claude CLI session fails every task identically, and each of those
+# failures costs one agent invocation and leaves one orphaned worktree behind
+# (observed for real: a 2-task run burned two of each on the same
+# "Failed to authenticate"). At 50 tasks that is 50 of each. Probing once,
+# before anything is created, turns the whole class into a single refusal that
+# names the fix. It lives here, next to the shared per-task core, so seed.sh
+# and `yolotown run` share one implementation instead of two that can drift.
+#
+# The probe prompt carries a stable marker so a test shim can recognize a probe
+# and answer it independently of how it plays the task agent — tests/fake-claude
+# switches on FAKE_CLAUDE_PROBE_MODE for a prompt carrying this marker, leaving
+# FAKE_CLAUDE_MODE to mean "how the TASK agent behaves". Change the marker here
+# and you must change it there.
+YT_AGENT_PROBE_MARKER="yolotown-agent-reachability-probe"
+
+# yt_agent_precheck — run CLAUDE_BIN once with a trivial prompt and stdin from
+# /dev/null (the agent is headless here too; it must never inherit, or stall
+# on, the caller's stdin). Returns 0 when the agent answers. On any nonzero
+# exit it prints the refusal — the offending binary, the probe's own output,
+# the likely cause, the exact fix — to stderr and returns 1; the caller exits.
+# Call it BEFORE creating a run dir or any worktree, so a refusal creates
+# nothing. Reads CLAUDE_BIN (config); the caller must have loaded config.
+yt_agent_precheck() {
+  local prompt="${YT_AGENT_PROBE_MARKER}: reply with the single word ok"
+  local out rc line
+  out="$("$CLAUDE_BIN" -p "$prompt" </dev/null 2>&1)"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    echo "$YT_PROG: agent reachable: $CLAUDE_BIN"
+    return 0
+  fi
+  {
+    printf '%s: error: agent binary "%s" is not reachable (probe exited %s)\n' \
+      "$YT_PROG" "$CLAUDE_BIN" "$rc"
+    printf 'probe: %s -p "%s" </dev/null\n' "$CLAUDE_BIN" "$prompt"
+    printf 'probe output:\n'
+    if [ -n "$out" ]; then
+      while IFS= read -r line; do printf '  %s\n' "$line"; done <<< "$out"
+    else
+      printf '  (none)\n'
+    fi
+    printf 'likely cause: the claude CLI session is expired or missing (or CLAUDE_BIN\n'
+    printf 'names a binary that is not installed).\n'
+    printf 'fix: claude logout && claude login\n'
+    printf 'refusing the whole run up front: no run dir and no worktree were created.\n'
+  } >&2
+  return 1
+}
 
 # _yt_task_fail <run-dir> <name> <reason> — record a per-task failure: mark
 # running -> failed (silenced) and stash the reason for the caller's report.

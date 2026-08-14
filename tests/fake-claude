@@ -3,7 +3,37 @@
 # Behavior selected by FAKE_CLAUDE_MODE (good | bad | noop | crash).
 # Always records its full argv (one arg per line) to $FAKE_CLAUDE_ARGV_FILE
 # when set, so tests can assert the prompt and flags of the invocation.
+# The reachability probe is answered separately, by FAKE_CLAUDE_PROBE_MODE —
+# see below.
 set -u
+
+# The invocation-level reachability probe (lib/task.sh yt_agent_precheck) is
+# recognized by the marker it carries in its prompt, and answered by
+# FAKE_CLAUDE_PROBE_MODE (ok | unreachable), which DEFAULTS TO ok. It is
+# deliberately not FAKE_CLAUDE_MODE: that keeps meaning "how the task agent
+# behaves", so e.g. crash mode still gets past preflight and reaches its
+# worktree. The probe answers and exits before the recording below, so the
+# argv/stdin files keep describing the task invocation only.
+for _arg in "$@"; do
+  case "$_arg" in
+    *yolotown-agent-reachability-probe*)
+      case "${FAKE_CLAUDE_PROBE_MODE:-ok}" in
+        ok)
+          echo "ok"
+          exit 0
+          ;;
+        unreachable)
+          echo "Invalid API key · Failed to authenticate. Please run /login" >&2
+          exit 1
+          ;;
+        *)
+          echo "fake-claude: unknown FAKE_CLAUDE_PROBE_MODE \"${FAKE_CLAUDE_PROBE_MODE}\"" >&2
+          exit 99
+          ;;
+      esac
+      ;;
+  esac
+done
 
 if [ -n "${FAKE_CLAUDE_ARGV_FILE:-}" ]; then
   printf '%s\n' "$@" > "$FAKE_CLAUDE_ARGV_FILE"

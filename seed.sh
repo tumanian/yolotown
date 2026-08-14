@@ -89,6 +89,12 @@ for f in $ENV_FILES; do
   [ -f "$f" ] || die "ENV_FILES entry \"$f\" not found in repo root"
 done
 
+# ---- agent reachability -------------------------------------------------------
+# One probe per invocation (lib/task.sh), before the base gate so an unreachable
+# agent is not paid for with a full suite run, and before the run dir and the
+# worktree exist so a refusal creates nothing. It prints its own refusal.
+yt_agent_precheck || exit 1
+
 # ---- base gate ----------------------------------------------------------------
 echo "seed: base gate: $TEST_CMD"
 bash -c "$TEST_CMD" || die "base suite is red; refusing to start (fix the base branch first)"
