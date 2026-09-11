@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # yolotown entrypoint: subcommand dispatch over the Stage 1 pipeline.
 #
-#   plan [tasks.txt]           parse + list the backlog; a dry run, touches nothing
+#   plan [tasks.txt]           conflict detection only: bucket the backlog, print
+#                              the buckets and the overlaps; the dry run
 #   run  [opts] [tasks.txt]    dispatch every task into one shared run dir, at most
 #                              MAX_PARALLEL at a time, continuing past individual
 #                              failures, then report
@@ -35,6 +36,9 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/fanout.sh
 . "$SELF_DIR/lib/fanout.sh" \
   || { printf 'yolotown: error: cannot source %s/lib/fanout.sh (broken install)\n' "$SELF_DIR" >&2; exit 1; }
+# shellcheck source=lib/plan.sh
+. "$SELF_DIR/lib/plan.sh" \
+  || { printf 'yolotown: error: cannot source %s/lib/plan.sh (broken install)\n' "$SELF_DIR" >&2; exit 1; }
 
 die() { printf 'yolotown: error: %s\n' "$*" >&2; exit 1; }
 
@@ -42,7 +46,10 @@ usage() {
   cat >&2 <<'USAGE'
 usage: yolotown <command> [args]
 
-  plan [tasks.txt]           parse and list the backlog; a dry run, touches nothing
+  plan [tasks.txt]           conflict detection only: bucket the backlog into DISJOINT /
+                             COLLIDING-SPLITTABLE / INHERENTLY-COUPLED and print the
+                             overlaps behind each. A dry run: no worktree, no branch,
+                             no task dispatched; the only thing written is plan.json
   run [opts] [tasks.txt]     dispatch every task, one run dir, continue past failures,
                              then print the fan-in report. Options:
                                --parallel N   at most N workers at once (default:
@@ -110,38 +117,63 @@ cmd_status() {
   yt_report "$run" "$BASE_BRANCH" "$BRANCH_PREFIX" "$(dirname "$toplevel")"
 }
 
-# cmd_plan [tasks.txt] — the dry run: parse the backlog and list the tasks that
-# `run` would dispatch, touching nothing on disk. Conflict-detection bucketing
-# (DISJOINT / COLLIDING-SPLITTABLE / INHERENTLY-COUPLED, per SPEC section 3.1)
-# is a Stage 3 feature; today plan proves the file parses and shows the work.
+# cmd_plan [tasks.txt] — the dry run (SPEC section 2): parse the backlog, run
+# conflict detection over it (SPEC 3.1, lib/plan.sh), and print the three
+# buckets with the file overlaps that produced them. This is what a human runs
+# BEFORE committing to a fan-out, so it dispatches nothing: no worktree, no
+# branch, no task agent, no status transitions. The only thing it writes is the
+# run dir holding plan.json, which is the answer itself.
+#
+# Deliberately NOT checked here, unlike `run`: a clean tree, being on
+# BASE_BRANCH, a green base suite, agent reachability. plan only reads the
+# index (`git ls-files`) and asks one question; refusing to answer it because
+# the tree is mid-edit would break the one moment plan exists for.
 cmd_plan() {
   [ $# -le 1 ] || die "plan takes at most one argument (the tasks file); got: $*"
   local toplevel; toplevel="$(_yt_repo_root)" || exit 1
   local tasks_file; tasks_file="$(_yt_resolve_tasks_file "$toplevel" "$#" "${1:-}")"
   cd "$toplevel" || die "cannot enter the repo root $toplevel"
 
+  # SOURCE_GLOBS (the inventory the planner reads), CLAUDE_BIN and
+  # PLANNER_MODEL (the call itself) all come from the config.
+  yt_load_config
+
   [ -f "$tasks_file" ] || die "tasks file not found: $tasks_file
 create it, one task per line: <short-name> | <description>"
 
   # yt_parse_tasks prints name<TAB>desc on success; on malformed input it prints
   # line-numbered errors to stderr (passed straight through here) and returns 1.
+  # Parsed first, and the run dir made only after: a malformed backlog must cost
+  # nothing on disk and nothing at the planner.
   local parsed rc
   parsed="$(yt_parse_tasks "$tasks_file")"; rc=$?
   [ "$rc" -eq 0 ] || die "tasks file has errors (see above); fix them and re-run"
 
-  printf 'plan: %s (dry run — nothing is written)\n\n' "$tasks_file"
   local n=0 name desc
   while IFS=$'\t' read -r name desc; do
     [ -n "$name" ] || continue
     n=$((n + 1))
-    printf '  %s | %s\n' "$name" "$desc"
   done <<< "$parsed"
   [ "$n" -gt 0 ] || die "no tasks found in $tasks_file (only comments/blank lines)"
 
-  printf '\n%d task%s would be dispatched by: yolotown run %s\n' \
-    "$n" "$([ "$n" -eq 1 ] && printf '' || printf 's')" "$tasks_file"
-  printf 'conflict detection (bucketing on the planner model) lands in Stage 3;\n'
-  printf 'today plan is a parse-and-list dry run that touches nothing.\n'
+  printf 'plan: %s — %d task%s (dry run: no worktree, no branch, nothing dispatched)\n' \
+    "$tasks_file" "$n" "$([ "$n" -eq 1 ] && printf '' || printf 's')"
+
+  # A run dir, because plan.json is per-run state and lives in one (SPEC 2). No
+  # task is registered in it: plan runs nothing, so nothing is pending.
+  local ytdir="$toplevel/.yolotown" run
+  run="$(yt_run_create "$ytdir")" || die "could not create a run dir under $ytdir"
+
+  local plan_file
+  plan_file="$(yt_plan "$run" "$parsed")" || die "conflict detection failed (see above); no plan was written
+the run dir left behind holds no plan.json: rm -rf $run"
+
+  printf '\n'
+  yt_plan_print "$plan_file" || die "cannot render the plan at $plan_file"
+
+  printf '\nplan: %s\n' "$plan_file"
+  printf 'plan: nothing else was created — no worktree, no branch, no task dispatched.\n'
+  printf 'next: yolotown run %s\n' "$tasks_file"
 }
 
 # ---- run: shared per-task worker --------------------------------------------
@@ -364,8 +396,11 @@ cmd_clean() {
     [ -n "$name" ] && names+=("$name")
   done < <(ls -1 "$run/status" 2>/dev/null | LC_ALL=C sort)
 
+  # A run dir can legitimately hold no tasks at all — `plan` makes one to put
+  # plan.json in and registers nothing — and "${names[@]}" on an empty array is
+  # an unbound-variable error under `set -u` on bash 3.2.
   local any=0 status wt branch
-  for name in "${names[@]}"; do
+  for name in ${names[@]+"${names[@]}"}; do
     status="$(yt_status_get "$run" "$name" 2>/dev/null)" || continue
     # Only passed/failed tasks ever got a worktree+branch; skipped/pending did
     # not, and running is in-flight (leave it alone).

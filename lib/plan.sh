@@ -19,6 +19,7 @@
 #   yt_plan_inventory                  the SOURCE_GLOBS inventory, one path/line
 #   yt_plan_tasks <plan.json>          "<name><TAB><bucket><TAB><files...>"
 #   yt_plan_collisions <plan.json>     "<bucket><TAB><tasks><TAB><files><TAB><reason>"
+#   yt_plan_print <plan.json>          the human-readable bucket report
 #
 # The three buckets, one per task:
 #   DISJOINT              shares no predicted file with any other task
@@ -426,4 +427,86 @@ yt_plan_collisions() {
   fi
   YT_PLAN_FILE="$f" node -e 'const p=JSON.parse(require("fs").readFileSync(process.env.YT_PLAN_FILE,"utf8"));for(const c of p.collisions)process.stdout.write(c.bucket+"\t"+c.tasks.join(" ")+"\t"+c.files.join(" ")+"\t"+c.reason+"\n")' \
     || { _yt_plan_die "cannot read the plan at $f (not the JSON yt_plan writes)"; return 1; }
+}
+
+# ---- rendering ---------------------------------------------------------------
+# The plan is machine state (plan.json) and a human answer. yt_plan_print is the
+# human answer, kept here next to the readers it is built from so the `plan`
+# subcommand and, later, `run`'s header render the same thing the same way.
+
+# _yt_plan_blurb <bucket> — the one line that says what a bucket MEANS for the
+# run about to happen, so a printed plan explains itself without SPEC.md open.
+_yt_plan_blurb() {
+  case "$1" in
+    DISJOINT)             printf 'share no predicted file; these fan out in parallel' ;;
+    COLLIDING-SPLITTABLE) printf 'overlap a shared module that could be split apart first' ;;
+    INHERENTLY-COUPLED)   printf 'overlap in the same logic; run sequentially, each rebased on the previous' ;;
+    *)                    printf '%s' "$1" ;;
+  esac
+}
+
+# _yt_plan_join <sep> <word>... — join the words with <sep>.
+_yt_plan_join() {
+  local sep="$1"; shift
+  local out="" w
+  for w in "$@"; do
+    if [ -z "$out" ]; then out="$w"; else out="$out$sep$w"; fi
+  done
+  printf '%s' "$out"
+}
+
+# yt_plan_print <plan.json> — render the plan for a human on stdout: the three
+# buckets in fixed order, every task under its bucket with the files predicted
+# for it, and under each colliding bucket the overlap groups that put the tasks
+# there — which tasks, which shared files, and the planner's reason. An empty
+# bucket still prints its (none): "nothing collided" is an answer the reader
+# came for, and a silently absent heading does not give it.
+yt_plan_print() {
+  local f="${1:-}" tasks collisions
+  tasks="$(yt_plan_tasks "$f")" || return 1
+  collisions="$(yt_plan_collisions "$f")" || return 1
+
+  # One pass for the name column width and the total; the buckets are then
+  # rendered in a fixed order rather than in whatever order the plan lists them.
+  local width=4 total=0 name bucket files
+  while IFS=$'\t' read -r name bucket files; do
+    [ -n "$name" ] || continue
+    total=$((total + 1))
+    [ "${#name}" -gt "$width" ] && width="${#name}"
+  done <<< "$tasks"
+
+  local b n first=1 summary="" ctasks cfiles reason
+  for b in DISJOINT COLLIDING-SPLITTABLE INHERENTLY-COUPLED; do
+    n=0
+    while IFS=$'\t' read -r name bucket files; do
+      [ "$bucket" = "$b" ] && n=$((n + 1))
+    done <<< "$tasks"
+
+    [ "$first" -eq 1 ] || printf '\n'
+    first=0
+    printf '%s (%d) — %s\n' "$b" "$n" "$(_yt_plan_blurb "$b")"
+    if [ "$n" -eq 0 ]; then
+      printf '  (none)\n'
+    else
+      while IFS=$'\t' read -r name bucket files; do
+        [ "$bucket" = "$b" ] || continue
+        printf '  %-*s  %s\n' "$width" "$name" "$files"
+      done <<< "$tasks"
+    fi
+    summary="$summary, $n $b"
+
+    # The overlaps that produced this bucket, directly under the tasks they
+    # explain. DISJOINT has none by definition.
+    [ "$b" = "DISJOINT" ] && continue
+    [ -n "$collisions" ] || continue
+    while IFS=$'\t' read -r bucket ctasks cfiles reason; do
+      [ "$bucket" = "$b" ] || continue
+      printf '    overlap: %s\n' "$(_yt_plan_join ' + ' $ctasks)"
+      printf '      files:  %s\n' "$cfiles"
+      printf '      reason: %s\n' "${reason:-(the planner gave none)}"
+    done <<< "$collisions"
+  done
+
+  printf '\nsummary: %d task%s — %s\n' \
+    "$total" "$([ "$total" -eq 1 ] && printf '' || printf 's')" "${summary#, }"
 }
