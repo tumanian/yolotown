@@ -3,8 +3,9 @@
 # Behavior selected by FAKE_CLAUDE_MODE (good | bad | noop | crash).
 # Always records its full argv (one arg per line) to $FAKE_CLAUDE_ARGV_FILE
 # when set, so tests can assert the prompt and flags of the invocation.
-# The reachability probe is answered separately, by FAKE_CLAUDE_PROBE_MODE —
-# see below.
+# The two NON-task invocations — the reachability probe and the conflict
+# detection planner — are answered separately, by FAKE_CLAUDE_PROBE_MODE and
+# FAKE_CLAUDE_PLAN_MODE; see below.
 set -u
 
 # The invocation-level reachability probe (lib/task.sh yt_agent_precheck) is
@@ -29,6 +30,105 @@ for _arg in "$@"; do
         *)
           echo "fake-claude: unknown FAKE_CLAUDE_PROBE_MODE \"${FAKE_CLAUDE_PROBE_MODE}\"" >&2
           exit 99
+          ;;
+      esac
+      ;;
+  esac
+done
+
+# The conflict-detection planner (lib/plan.sh yt_plan) is recognized the same
+# way — by the marker its prompt carries — and answered by FAKE_CLAUDE_PLAN_MODE
+# (default disjoint). It is deliberately NOT FAKE_CLAUDE_MODE: at Stage 3
+# maturity one `run` calls the planner once and then N task agents through this
+# same binary, so "how the planner answers" and "how the task agent behaves"
+# have to be separately settable. Like the probe, it answers and exits before
+# the argv/stdin recording below, so those files keep describing the TASK
+# invocation only; the planner's own argv goes to FAKE_CLAUDE_PLAN_ARGV_FILE.
+#
+# The canned plans are generated from the task names parsed out of the prompt's
+# "TASK <name> | ..." lines, so a mode fits whatever backlog the test used:
+#   disjoint (default)  every task gets its own file; no collisions
+#   collide             the first two tasks share src/shared.js, reported as
+#                       COLLIDING-SPLITTABLE; any others stay DISJOINT
+#   coupled             same overlap, reported as INHERENTLY-COUPLED
+#   hidden-collision    the first two tasks share a file but the plan claims
+#                       DISJOINT and reports nothing (the dangerous answer)
+#   missing-task        drops the last task from "tasks"
+#   unknown-task        adds a task that is not in the backlog
+#   duplicate-task      lists the first task twice
+#   bad-bucket          a bucket outside the three
+#   no-files            a task with an empty "files"
+#   uncollided          a task bucketed COLLIDING-SPLITTABLE with no collision
+#   half-collision      a collision whose shared file only one task predicts
+#   prose               no JSON at all
+#   truncated           JSON that does not parse
+#   silent              exit 0 with no output
+#   crash               exit nonzero
+for _arg in "$@"; do
+  case "$_arg" in
+    *yolotown-conflict-detection-plan*)
+      if [ -n "${FAKE_CLAUDE_PLAN_ARGV_FILE:-}" ]; then
+        printf '%s\n' "$@" > "$FAKE_CLAUDE_PLAN_ARGV_FILE"
+      fi
+      case "${FAKE_CLAUDE_PLAN_MODE:-disjoint}" in
+        crash)
+          echo "fake-claude: simulated planner crash" >&2
+          exit 1
+          ;;
+        silent)
+          exit 0
+          ;;
+        prose)
+          echo "I looked over the backlog and the tasks all seem fine to me."
+          exit 0
+          ;;
+        truncated)
+          # Braces on both ends, so this reaches the JSON parser and is
+          # rejected there rather than by the "no JSON at all" check.
+          printf '{"tasks": [{"name": "alpha"}\n'
+          exit 0
+          ;;
+        *)
+          FAKE_PLAN_PROMPT="$_arg" FAKE_PLAN_MODE="${FAKE_CLAUDE_PLAN_MODE:-disjoint}" node -e '
+const prompt = process.env.FAKE_PLAN_PROMPT, mode = process.env.FAKE_PLAN_MODE;
+const bail = (m) => { console.error("fake-claude: " + m); process.exit(99); };
+const names = prompt.split("\n").filter((l) => l.startsWith("TASK "))
+  .map((l) => l.slice(5).split("|")[0].trim());
+if (!names.length) bail("the planner prompt carried no \"TASK <name> | ...\" lines");
+const need = (n) => { if (names.length < n) bail("FAKE_CLAUDE_PLAN_MODE=" + mode + " needs at least " + n + " tasks, got " + names.length); };
+const SHARED = "src/shared.js";
+let tasks = names.map((n) => ({ name: n, files: ["src/" + n + ".js"], bucket: "DISJOINT" }));
+let collisions = [];
+const overlap = (bucket) => { need(2); tasks[0].files.push(SHARED); tasks[1].files.push(SHARED); tasks[0].bucket = bucket; tasks[1].bucket = bucket; };
+switch (mode) {
+  case "disjoint": break;
+  case "collide":
+  case "coupled":
+    overlap(mode === "collide" ? "COLLIDING-SPLITTABLE" : "INHERENTLY-COUPLED");
+    collisions = [{ tasks: [names[0], names[1]], files: [SHARED], reason: "both tasks rewrite " + SHARED }];
+    break;
+  case "hidden-collision": need(2); tasks[0].files.push(SHARED); tasks[1].files.push(SHARED); break;
+  case "missing-task": need(2); tasks.pop(); break;
+  case "unknown-task": tasks.push({ name: "ghost-task", files: ["src/ghost.js"], bucket: "DISJOINT" }); break;
+  case "duplicate-task": tasks.push(tasks[0]); break;
+  case "bad-bucket": tasks[0].bucket = "PROBABLY-FINE"; break;
+  case "no-files": tasks[0].files = []; break;
+  case "uncollided": tasks[0].bucket = "COLLIDING-SPLITTABLE"; break;
+  case "half-collision":
+    need(2);
+    tasks[0].files.push(SHARED);
+    tasks[0].bucket = "COLLIDING-SPLITTABLE";
+    tasks[1].bucket = "COLLIDING-SPLITTABLE";
+    collisions = [{ tasks: [names[0], names[1]], files: [SHARED], reason: "only one of them actually predicts it" }];
+    break;
+  default: bail("unknown FAKE_CLAUDE_PLAN_MODE \"" + mode + "\"");
+}
+// A line of chatter first, on purpose: a real model prefaces its JSON, and the
+// validator has to survive that while still rejecting a response with no JSON.
+process.stdout.write("Here is the conflict analysis you asked for.\n");
+process.stdout.write(JSON.stringify({ tasks, collisions }, null, 2) + "\n");
+'
+          exit $?
           ;;
       esac
       ;;
