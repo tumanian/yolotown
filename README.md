@@ -204,6 +204,43 @@ single-task run.
 Matching is exact on repo-relative paths, with no prefix or directory
 leniency: a warning that quietly forgives a whole subtree is one nobody reads.
 
+## Coupled groups (`lib/fanout.sh`) — the one place tasks are not parallel
+
+`INHERENTLY-COUPLED` is conflict detection's third bucket: tasks that overlap in
+the same *logic*, not merely in a file that could be split apart. Fanning those
+out side by side produces two branches that each ignore the other's work, so the
+scheduler runs them as a **chain** instead (SPEC.md section 3.1).
+
+The unit of dispatch is `yt_fanout_chains`' *chain* — one argument holding
+`<name><TAB><desc>` lines, exactly `yt_parse_tasks`' own output format. A
+one-task chain is an ordinary independent task; a multi-task chain is a coupled
+group, and inside it:
+
+- tasks run **in order, one at a time**, however many worker slots are free;
+- each task's worktree is cut from the **previous task's branch** rather than
+  from `BASE_BRANCH`, so task 2 starts from task 1's result, sees it, builds on
+  it, and is gated with it (that is the whole of "each rebased on the previous
+  result"). Its lane check diffs against that same ref, so it is judged on its
+  own changes rather than on its predecessor's too;
+- the **first failure abandons the rest**. Everything after a failed task would
+  be cut from a branch that doesn't carry the work it was supposed to build on,
+  so it is never dispatched: those tasks go `pending -> skipped` and the report
+  renders them `SKIPPED`, with the reason in each one's own log.
+
+```
+run: dispatch alpha -> beta -> gamma (coupled group 1/2, 1/3 workers busy)
+run: dispatch solo (task 2/2, 2/3 workers busy)
+
+task beta: FAILED (agent exited nonzero (1))
+task gamma: SKIPPED (an earlier task in its coupled group failed; a task
+rebased on a failure is meaningless)
+```
+
+A group is **one worker** however many tasks it holds, so `MAX_PARALLEL` still
+means agents in flight. Groups fan out against *each other* and against lone
+tasks; only the inside of a group is serial. A group's failure is contained to
+that group, exactly as a single task's failure is contained to that task.
+
 ## Testing
 
 ```sh
@@ -235,4 +272,6 @@ filesystem origin; the agent is a shim (`tests/fake-claude`) selected via
 - No resumability of interrupted runs.
 - Conflict detection is not wired into `run` yet: `plan` buckets a backlog on
   demand, but `run` still assumes you wrote the tasks so they don't collide.
-  The gated refactor stage and that wiring are the rest of Stage 3.
+  The coupled-group scheduler above is likewise reachable only through
+  `lib/fanout.sh`, because nothing yet hands `run` the buckets to build chains
+  from. The gated refactor stage and that wiring are the rest of Stage 3.
