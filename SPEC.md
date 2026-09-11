@@ -280,6 +280,14 @@ scheduled for correction or explicitly accepted.
   tasks, touching nothing — its usage text claims no more than that. The real
   implementation is Stage 3 work (§3.1); until then `plan` is a backlog
   linter, not a conflict detector.
+- **Refactor-gate approval is approve/reject only** (decided 2026-09-11). §3.2
+  lists approve / reject / edit; `edit` is deferred. Rejecting and then
+  amending `tasks.txt` covers the same need for now.
+- **`run --no-plan` skips conflict detection and the refactor gate** (added
+  with `run-wiring`), treating every task as DISJOINT. Not in §2's CLI
+  surface. It preserves the Stage 2 behavior — a human-curated disjoint
+  backlog — without paying for a planner call, and announces itself loudly in
+  the run header.
 - **The agent prompt does not inject this file.** `seed.sh` splices
   `INVARIANTS_FILE` (`CLAUDE.md`) into every worker prompt, but SPEC.md is only
   read if a task description happens to name it. Task descriptions currently

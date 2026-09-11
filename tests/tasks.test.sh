@@ -200,7 +200,7 @@ EOF
 # It is expected to need updating when a stage's backlog turns over — that edit
 # is the point, because it forces a human to look at an emptied backlog rather
 # than let the suite stay green through it.
-assert_contains "$PARSE_OUT" "coupled-serial${TAB}" "repo tasks.txt still carries the final Stage 3 task"
+assert_contains "$PARSE_OUT" "run-wiring${TAB}" "repo tasks.txt still carries the final Stage 3 task"
 ok "repo tasks.txt is well-formed"
 
 echo "tasks: all cases passed"
