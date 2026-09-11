@@ -36,6 +36,15 @@
 
 : "${YT_PROG:=yolotown}"
 
+# The gate-time lane check (SPEC.md section 3.4) is a step of the pipeline
+# below, not of any one caller, so the core declares the dependency itself
+# rather than leaving all three of its wrappers (seed.sh, `yolotown run`, the
+# fan-out worker) to remember it. Sourcing only defines functions, so an
+# entrypoint that also sources it pays nothing.
+# shellcheck source=lib/lane.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lane.sh" \
+  || { printf '%s: error: cannot source lib/lane.sh (broken install)\n' "$YT_PROG" >&2; return 1; }
+
 # ---- invocation-level preflight ---------------------------------------------
 # One agent reachability probe per INVOCATION — never per task. An expired or
 # missing claude CLI session fails every task identically, and each of those
@@ -275,6 +284,26 @@ Authored by yolotown via headless claude agent."
       return 2
     fi
   fi
+
+  # Lane check, last thing on the green path exactly as SPEC.md section 3.4
+  # orders it (commit, push, then the lane check). WARN ONLY: it can only drop
+  # a warnings/<name> record for the report to render as PASSED-WITH-WARNING,
+  # and its return is not even consulted — a strayed task is a passed task
+  # (SPEC.md sections 2 and 7). A task with no plan.json prediction, which is
+  # every run-one, is "unchecked" and says so once in the log.
+  yt_lane_check "$run" "$name" "$wt" "$BASE_BRANCH"
+  case "$YT_LANE_VERDICT" in
+    strayed)
+      echo "run: lane: WARNING — outside the lane plan.json predicted: $YT_LANE_STRAY" | tee -a "$log"
+      echo "run: lane: warn only — $name still PASSED; record: $YT_LANE_WARNING" | tee -a "$log"
+      ;;
+    in-lane)
+      echo "run: lane: inside the lane plan.json predicted" | tee -a "$log"
+      ;;
+    *)
+      echo "run: lane: not checked (no plan.json prediction for $name)" | tee -a "$log"
+      ;;
+  esac
 
   yt_status_set "$run" "$name" passed >/dev/null 2>&1 || true
   return 0

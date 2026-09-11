@@ -168,6 +168,42 @@ no tasks registered in it. Because it only reads the index, it answers on a
 dirty tree and off `BASE_BRANCH` too — the states `run` refuses — which is
 exactly when you want to ask.
 
+## Lane checking (`lib/lane.sh`) — warn only
+
+Those per-task file predictions are also a *lane*. At gate time — after the
+suite is green and the commit is made — the core diffs what the agent actually
+touched (`git diff --name-only <base>...HEAD` in its worktree) against what
+`plan.json` predicted for that task. Anything touched that the plan didn't name
+is a stray, and a stray writes `<run-dir>/warnings/<task>`:
+
+```
+$ cat .yolotown/latest/warnings/add-rss
+strayed outside predicted lane: touched docs/notes.md
+predicted: src/feed.js src/routes.js
+touched:   src/feed.js docs/notes.md
+warn only: a lane violation never fails a task (SPEC.md sections 2 and 7).
+```
+
+The report reads that file and nothing else to render `PASSED-WITH-WARNING`,
+showing line 1 in the table beside the usual pointers and the usual merge
+command.
+
+**It never fails a task.** A strayed task is committed, pushed, and reported
+green exactly like any other; the warning is a note for the human reviewing the
+branch, not a gate. Whether lane violations ever become blocking is a decision
+deliberately deferred (SPEC.md section 7), so the check has no path that can
+fail a task even by accident.
+
+**No prediction is not a violation.** `yolotown run-one` never runs conflict
+detection, so its run dir has no `plan.json` and there is nothing to compare
+against; the same goes for a task a plan simply doesn't name. Those are
+*unchecked*, which is silent — no warning file, no `warnings/` directory, one
+line in the log saying why. Warning there would mean warning on every
+single-task run.
+
+Matching is exact on repo-relative paths, with no prefix or directory
+leniency: a warning that quietly forgives a whole subtree is one nobody reads.
+
 ## Testing
 
 ```sh
