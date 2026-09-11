@@ -108,16 +108,36 @@ Plain shell-sourceable `key=value` at the target repo root.
 |---|---|---|
 | `TEST_CMD` | *(required)* | the acceptance gate; its exit code decides everything |
 | `ENV_FILES` | empty | space-separated git-ignored files copied into each worktree |
+| `SOURCE_GLOBS` | source-ish extensions | git pathspecs; the file inventory conflict detection reads |
 | `INVARIANTS_FILE` | `CLAUDE.md` if present | injected into agent prompts |
 | `BASE_BRANCH` | `main` | branch worktrees are cut from |
 | `BRANCH_PREFIX` | `feature/` | prefix for task branches |
 | `PUSH_ON_GREEN` | `true` | `false` = commit locally, don't push |
 | `MAX_PARALLEL` | `3` | workers `yolotown run` keeps in flight at once |
+| `PLANNER_MODEL` | CLI default | model for conflict detection and refactor planning |
 | `WORKER_MODEL` | CLI default | model for task execution |
 | `CLAUDE_BIN` | `claude` | agent binary; also the test seam |
 
-Keys used by later stages (`SOURCE_GLOBS`, `PLANNER_MODEL`) are accepted and
-ignored for now.
+`SOURCE_GLOBS` is handed straight to `git ls-files`, so its globs match at any
+depth (`*.js` finds `src/a.js`) and the default is literally "every tracked
+file with a source-ish extension" — see `YT_SOURCE_GLOBS_DEFAULT` in
+`lib/config.sh`. A repo whose entrypoints carry no extension names them
+explicitly; this one does, in its own `.yolotown.conf`. Setting the key to the
+empty string is refused rather than read as "every file".
+
+## Conflict detection (`lib/plan.sh`)
+
+One headless call on `PLANNER_MODEL` turns the backlog plus that inventory into
+`<run-dir>/plan.json`: each task mapped to the files it will likely touch and
+sorted into exactly one of `DISJOINT`, `COLLIDING-SPLITTABLE` or
+`INHERENTLY-COUPLED`, plus the collision report of overlapping groups.
+
+An answer that is unparseable, incomplete, or self-contradictory is a hard
+failure that names what was wrong and writes no `plan.json`. There is no
+fallback to "everything is disjoint" — that would be the most dangerous failure
+this tool could have, because it green-lights a fan-out of tasks that overwrite
+each other. The plan is even cross-examined against itself: two tasks predicting
+the same file with no collision reporting them together is rejected.
 
 ## Testing
 
