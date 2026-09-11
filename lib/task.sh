@@ -17,12 +17,21 @@
 # instead of exiting, so a batch continues past a failure and each caller
 # renders its own report from the task-scoped globals below.
 #
-#   yt_run_task <run-dir> <name> <desc>
+#   yt_run_task <run-dir> <name> <desc> [<base-ref>]
 #     reads (the caller sets these from config before calling):
 #       BASE_BRANCH BRANCH_PREFIX ENV_FILES TEST_CMD CLAUDE_BIN WORKER_MODEL
 #       PUSH_ON_GREEN INVARIANTS_CONTENT WORKTREE_PARENT
+#     <base-ref> is what the worktree is cut from, defaulting to BASE_BRANCH.
+#     The INHERENTLY-COUPLED scheduler (lib/fanout.sh) passes the PREVIOUS
+#     task's branch here, which is the whole of "each rebased on the previous
+#     result" (SPEC.md section 3.1): the task's branch starts at that commit,
+#     so its work sits on top of it instead of racing it from a stale base.
+#     Everything else about the task is identical either way — including the
+#     lane check, which diffs against this same ref so a coupled task is judged
+#     on its OWN changes rather than on its predecessor's too.
 #     writes (for the caller's report):
 #       YT_TASK_BRANCH  the feature branch name
+#       YT_TASK_BASE    the ref the worktree was cut from
 #       YT_TASK_WT      the worktree path
 #       YT_TASK_LOG     the per-task log path under the run dir
 #       YT_TASK_PUSHED  yes|no — whether the commit reached origin
@@ -155,7 +164,7 @@ _yt_task_fail() {
 }
 
 yt_run_task() {
-  local run="$1" name="$2" desc="$3" rc
+  local run="$1" name="$2" desc="$3" base="${4:-$BASE_BRANCH}" rc
   local branch="${BRANCH_PREFIX}${name}"
   local wt="$WORKTREE_PARENT/yt-${name}"
   local log="$run/logs/${name}.log"
@@ -167,6 +176,7 @@ yt_run_task() {
   # Publish the pointers up front so the caller can report them even on an
   # early failure. PUSHED/REASON are reset each call so a reused shell is clean.
   YT_TASK_BRANCH="$branch"
+  YT_TASK_BASE="$base"
   YT_TASK_WT="$wt"
   YT_TASK_LOG="$log"
   YT_TASK_PUSHED="no"
@@ -176,6 +186,7 @@ yt_run_task() {
   yt_status_set "$run" "$name" running >/dev/null 2>&1 || true
   {
     echo "run: task=$name branch=$branch"
+    echo "run: base=$base"
     echo "run: worktree=$wt"
     echo "run: log=$log"
   } | tee -a "$log"
@@ -190,12 +201,20 @@ yt_run_task() {
     _yt_task_fail "$run" "$name" "worktree \"$wt\" already exists; cleanup: git worktree remove --force $wt"
     return 1
   fi
+  # The base must resolve to a commit before anything is created. A coupled
+  # task's base is the previous task's branch, so a missing one means the
+  # scheduler dispatched a task whose predecessor never landed — name it here
+  # rather than letting `git worktree add` fail with its own wording.
+  if ! git rev-parse --verify --quiet "$base^{commit}" >/dev/null 2>&1; then
+    _yt_task_fail "$run" "$name" "base ref \"$base\" does not resolve to a commit; nothing to cut a worktree from"
+    return 1
+  fi
 
   if ! _yt_wt_lock "$wtlock"; then
     _yt_task_fail "$run" "$name" "timed out waiting for the worktree lock $wtlock; if no yolotown run is in flight, remove it: rm -rf $wtlock"
     return 1
   fi
-  git worktree add "$wt" -b "$branch" "$BASE_BRANCH" >>"$log" 2>&1
+  git worktree add "$wt" -b "$branch" "$base" >>"$log" 2>&1
   rc=$?
   _yt_wt_unlock "$wtlock"
   [ "$rc" -eq 0 ] || {
@@ -291,7 +310,7 @@ Authored by yolotown via headless claude agent."
   # and its return is not even consulted — a strayed task is a passed task
   # (SPEC.md sections 2 and 7). A task with no plan.json prediction, which is
   # every run-one, is "unchecked" and says so once in the log.
-  yt_lane_check "$run" "$name" "$wt" "$BASE_BRANCH"
+  yt_lane_check "$run" "$name" "$wt" "$base"
   case "$YT_LANE_VERDICT" in
     strayed)
       echo "run: lane: WARNING — outside the lane plan.json predicted: $YT_LANE_STRAY" | tee -a "$log"
