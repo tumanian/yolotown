@@ -284,7 +284,22 @@ scheduled for correction or explicitly accepted.
   leaves that run dir empty and names the `rm -rf` in its error.
 - **Refactor-gate approval is approve/reject only** (decided 2026-09-11). §3.2
   lists approve / reject / edit; `edit` is deferred. Rejecting and then
-  amending `tasks.txt` covers the same need for now.
+  amending `tasks.txt` covers the same need for now. `edit` is not silently
+  ignored: it is read as a rejection that says the option is deferred.
+- **The run dir carries `refactor/<n>/`** (added with `refactor-gate`), one
+  directory per gated COLLIDING-SPLITTABLE group, holding `plan.txt` (the
+  refactor plan the human was shown, verbatim), `decision` (one word:
+  approved / rejected / failed), `reason`, `log` (the refactor agent's and the
+  suite's full output) and, on green, `commit` (the sha `BASE_BRANCH` was
+  fast-forwarded to). Not in §2's layout; flat and `cat`-able like everything
+  else. The one decision in this pipeline a human makes has to be readable
+  afterwards without rerunning anything — and a red refactor's worktree is
+  discarded, so its log is the only evidence left.
+- **The refactor worktree is `yt-refactor-<n>`, cut DETACHED**, not on a
+  branch as §2's worktree bullet describes for tasks. Its commit is destined
+  for `BASE_BRANCH` and nowhere else, so a feature branch would only be a name
+  to collide with and to clean up. The advanced base is never pushed: remote
+  base branches stay the human's (§4).
 - **`run --no-plan` skips conflict detection and the refactor gate** (added
   with `run-wiring`), treating every task as DISJOINT. Not in §2's CLI
   surface. It preserves the Stage 2 behavior — a human-curated disjoint

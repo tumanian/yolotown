@@ -3,9 +3,13 @@
 # Behavior selected by FAKE_CLAUDE_MODE (good | bad | noop | crash).
 # Always records its full argv (one arg per line) to $FAKE_CLAUDE_ARGV_FILE
 # when set, so tests can assert the prompt and flags of the invocation.
-# The two NON-task invocations — the reachability probe and the conflict
-# detection planner — are answered separately, by FAKE_CLAUDE_PROBE_MODE and
-# FAKE_CLAUDE_PLAN_MODE; see below.
+# The four NON-task invocations — the reachability probe, the conflict
+# detection planner, the refactor planner and the refactor executor — are
+# answered separately, by FAKE_CLAUDE_PROBE_MODE, FAKE_CLAUDE_PLAN_MODE,
+# FAKE_CLAUDE_REFACTOR_PLAN_MODE and FAKE_CLAUDE_REFACTOR_MODE; see below.
+# Each is recognized by the stable marker its prompt carries, so one `run` can
+# make all of them through this one binary and a test can steer each
+# independently.
 set -u
 
 # The invocation-level reachability probe (lib/task.sh yt_agent_precheck) is
@@ -127,6 +131,116 @@ switch (mode) {
 // validator has to survive that while still rejecting a response with no JSON.
 process.stdout.write("Here is the conflict analysis you asked for.\n");
 process.stdout.write(JSON.stringify({ tasks, collisions }, null, 2) + "\n");
+'
+          exit $?
+          ;;
+      esac
+      ;;
+  esac
+done
+
+# The refactor gate (lib/refactor.sh) makes TWO calls, and they are answered
+# apart from each other as well as from everything above — a test has to be
+# able to approve a plan and then make the execution go red, or make the
+# planning itself fail before any approval is ever asked for.
+#
+# The EXECUTE call is matched FIRST on purpose: its prompt quotes the approved
+# plan verbatim, so a plan whose text happened to mention the planning marker
+# would otherwise be mistaken for a planning call.
+#
+#   yolotown-refactor-execute -> FAKE_CLAUDE_REFACTOR_MODE (default good)
+#     good   the behavior-preserving split this fixture's gate stays green on:
+#            the printing moves to src/greet.js and src/app.js calls it, so
+#            `node src/app.js` still prints "app ok"
+#     bad    an edit that leaves the gate RED (the refactor must be discarded
+#            and the base branch must not move)
+#     noop   changes nothing, exits 0
+#     crash  exits nonzero
+#   yolotown-refactor-plan -> FAKE_CLAUDE_REFACTOR_PLAN_MODE (default plan)
+#     plan     a plausible four-heading refactor plan, naming the colliding
+#              tasks and shared files it was given
+#     splitless a plan that says the collision cannot be split apart (a real
+#              answer a human is meant to reject)
+#     silent   exit 0 with no output
+#     crash    exit nonzero
+# Both record their own argv (FAKE_CLAUDE_REFACTOR_ARGV_FILE,
+# FAKE_CLAUDE_REFACTOR_PLAN_ARGV_FILE) and, like the probe and the planner,
+# answer and exit before the task-agent recording below, so FAKE_CLAUDE_ARGV_FILE
+# keeps describing the TASK invocation only.
+for _arg in "$@"; do
+  case "$_arg" in
+    *yolotown-refactor-execute*)
+      if [ -n "${FAKE_CLAUDE_REFACTOR_ARGV_FILE:-}" ]; then
+        printf '%s\n' "$@" > "$FAKE_CLAUDE_REFACTOR_ARGV_FILE"
+      fi
+      case "${FAKE_CLAUDE_REFACTOR_MODE:-good}" in
+        good)
+          mkdir -p src
+          cat > src/greet.js <<'EOF'
+// split out of src/app.js by the refactor agent; behavior unchanged
+module.exports = function greet() { console.log("app ok"); };
+EOF
+          cat > src/app.js <<'EOF'
+require("./greet")();
+EOF
+          echo "I followed the approved plan: moved the printing into src/greet.js"
+          echo "and left src/app.js calling it. Ran the gate; it exits 0. Done."
+          exit 0
+          ;;
+        bad)
+          printf 'this is not valid javascript {{{\n' > src/app.js
+          echo "I split src/app.js as the plan asked."
+          exit 0
+          ;;
+        noop)
+          echo "Upon inspection, the files were already disjoint; I changed nothing."
+          exit 0
+          ;;
+        crash)
+          echo "fatal: simulated refactor agent crash" >&2
+          exit 1
+          ;;
+        *)
+          echo "fake-claude: unknown FAKE_CLAUDE_REFACTOR_MODE \"${FAKE_CLAUDE_REFACTOR_MODE}\"" >&2
+          exit 99
+          ;;
+      esac
+      ;;
+  esac
+done
+
+for _arg in "$@"; do
+  case "$_arg" in
+    *yolotown-refactor-plan*)
+      if [ -n "${FAKE_CLAUDE_REFACTOR_PLAN_ARGV_FILE:-}" ]; then
+        printf '%s\n' "$@" > "$FAKE_CLAUDE_REFACTOR_PLAN_ARGV_FILE"
+      fi
+      case "${FAKE_CLAUDE_REFACTOR_PLAN_MODE:-plan}" in
+        crash)
+          echo "fake-claude: simulated refactor planner crash" >&2
+          exit 1
+          ;;
+        silent)
+          exit 0
+          ;;
+        *)
+          FAKE_REFACTOR_PROMPT="$_arg" FAKE_REFACTOR_MODE="${FAKE_CLAUDE_REFACTOR_PLAN_MODE:-plan}" node -e '
+const prompt = process.env.FAKE_REFACTOR_PROMPT, mode = process.env.FAKE_REFACTOR_MODE;
+const pick = (p) => prompt.split("\n").filter((l) => l.startsWith(p)).map((l) => l.slice(p.length).split("|")[0].trim());
+const names = pick("TASK "), files = pick("FILE ");
+if (!names.length) { console.error("fake-claude: the refactor prompt carried no \"TASK <name> | ...\" lines"); process.exit(99); }
+if (!files.length) { console.error("fake-claude: the refactor prompt carried no \"FILE <path>\" lines"); process.exit(99); }
+if (mode !== "plan" && mode !== "splitless") { console.error("fake-claude: unknown FAKE_CLAUDE_REFACTOR_PLAN_MODE \"" + mode + "\""); process.exit(99); }
+const shared = files[0], stem = shared.replace(/\.[^./]+$/, "");
+if (mode === "splitless") {
+  process.stdout.write("SPLIT\n  None possible. " + shared + " is one state machine; every task below\n  rewrites the same transitions, so no split makes them disjoint.\n");
+  process.stdout.write("MOVES\n  (none)\nUPDATES\n  (none)\nWHY\n" + names.map((n) => "  " + n + ": still needs all of " + shared + "\n").join(""));
+  process.exit(0);
+}
+process.stdout.write("SPLIT\n  " + shared + " splits into " + names.map((n) => stem + "-" + n + ".js").join(" and ") + ".\n");
+process.stdout.write("MOVES\n" + names.map((n) => "  the " + n + " half of " + shared + " -> " + stem + "-" + n + ".js\n").join(""));
+process.stdout.write("UPDATES\n  every importer of " + shared + " imports the half it actually uses.\n");
+process.stdout.write("WHY\n" + names.map((n) => "  " + n + ": touches " + stem + "-" + n + ".js only, which no other task touches.\n").join(""));
 '
           exit $?
           ;;
