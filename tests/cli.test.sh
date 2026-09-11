@@ -195,10 +195,11 @@ run_yt run-one solo
 ok "run-one: delegates to seed.sh, single-task PASSED, arity checked"
 
 # =============================================================================
-# plan — parse + list dry run, touches nothing; malformed input fails fast
+# plan — the dispatch-level contract: it buckets the backlog and dispatches
+# nothing. The bucketing itself is covered in depth by plan-cmd.test.sh.
 # =============================================================================
 reset_fixture
-make_fixture_repo   # no origin, no agent: plan never dispatches
+make_fixture_repo   # no origin, no task agent: plan never dispatches one
 
 cat > "$REPO/backlog.txt" <<'EOF'
 # planning only
@@ -211,15 +212,20 @@ assert_eq "$YT_RC" 0 "plan exits 0 on a well-formed backlog"
 assert_contains "$YT_OUT" "red" "plan lists the first task"
 assert_contains "$YT_OUT" "blue" "plan lists the second task"
 assert_contains "$YT_OUT" "dry run" "plan announces it is a dry run"
-assert_contains "$YT_OUT" "Stage 3" "plan notes conflict detection is deferred to Stage 3"
-assert_file_missing "$REPO/.yolotown" "plan touches nothing on disk"
+assert_contains "$YT_OUT" "DISJOINT" "plan prints the buckets conflict detection produced"
+# The only thing written is the plan: no branch, no worktree, no dispatch.
+assert_file_exists "$REPO/.yolotown/latest/plan.json" "plan writes plan.json and nothing else"
+assert_eq "$(git -C "$REPO" worktree list | wc -l | tr -d ' ')" "1" "plan creates no worktree"
+assert_eq "$(git -C "$REPO" branch --list | wc -l | tr -d ' ')" "1" "plan creates no branch"
 
+reset_fixture
+make_fixture_repo
 printf 'this line has no separator\n' > "$REPO/bad.txt"
 run_yt plan bad.txt
 [ "$YT_RC" -ne 0 ] || _fail "plan on a malformed backlog should fail"
 assert_contains "$YT_OUT" "missing" "plan surfaces the parser's line-numbered error"
-assert_file_missing "$REPO/.yolotown" "a failed plan still touches nothing"
-ok "plan: dry-run lists tasks and touches nothing; malformed input fails fast"
+assert_file_missing "$REPO/.yolotown" "a malformed backlog costs nothing on disk"
+ok "plan: buckets the backlog, dispatches nothing; malformed input fails fast"
 
 # =============================================================================
 # run — malformed backlog fails fast, before any run dir is created

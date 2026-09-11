@@ -62,7 +62,7 @@ Write the tasks one per line in `tasks.txt` as `<short-name> | <description>`
 (`#` comments and blank lines are fine), then:
 
 ```sh
-/path/to/yolotown/yolotown plan            # parse and list; touches nothing
+/path/to/yolotown/yolotown plan            # conflict detection only; dispatches nothing
 /path/to/yolotown/yolotown run             # dispatch the backlog
 /path/to/yolotown/yolotown status          # the latest run's table again
 /path/to/yolotown/yolotown clean --force   # remove the leftover worktrees
@@ -139,6 +139,35 @@ this tool could have, because it green-lights a fan-out of tasks that overwrite
 each other. The plan is even cross-examined against itself: two tasks predicting
 the same file with no collision reporting them together is rejected.
 
+`yolotown plan` is that detection on its own — the dry run you do before
+committing to a fan-out:
+
+```
+$ yolotown plan backlog.txt
+plan: backlog.txt — 3 tasks (dry run: no worktree, no branch, nothing dispatched)
+
+DISJOINT (1) — share no predicted file; these fan out in parallel
+  gamma  src/gamma.js
+
+COLLIDING-SPLITTABLE (2) — overlap a shared module that could be split apart first
+  alpha  src/alpha.js src/shared.js
+  beta   src/beta.js src/shared.js
+    overlap: alpha + beta
+      files:  src/shared.js
+      reason: both rewrite the router
+
+INHERENTLY-COUPLED (0) — overlap in the same logic; run sequentially, each rebased on the previous
+  (none)
+
+summary: 3 tasks — 1 DISJOINT, 2 COLLIDING-SPLITTABLE, 0 INHERENTLY-COUPLED
+```
+
+It dispatches nothing: no worktree, no branch, no task agent, no status
+transition. The one thing it writes is the `plan.json` above, in a run dir with
+no tasks registered in it. Because it only reads the index, it answers on a
+dirty tree and off `BASE_BRANCH` too — the states `run` refuses — which is
+exactly when you want to ask.
+
 ## Testing
 
 ```sh
@@ -168,6 +197,6 @@ filesystem origin; the agent is a shim (`tests/fake-claude`) selected via
   hangs (Ctrl-C is safe; worktrees are never auto-deleted once an agent has
   run).
 - No resumability of interrupted runs.
-- No conflict detection yet: `plan` only parses and lists, and `run` assumes
-  you wrote the backlog so its tasks don't collide. Bucketing and the gated
-  refactor stage are Stage 3.
+- Conflict detection is not wired into `run` yet: `plan` buckets a backlog on
+  demand, but `run` still assumes you wrote the tasks so they don't collide.
+  The gated refactor stage and that wiring are the rest of Stage 3.

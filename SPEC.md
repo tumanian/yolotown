@@ -274,12 +274,14 @@ scheduled for correction or explicitly accepted.
   (it walks `.git/worktrees/*` and reads siblings another add is still
   writing). Both stay inside the "writes only to `.yolotown/`" rule and stay
   `cat`-able; neither changes the status state machine.
-- **`plan` is a placeholder** (introduced with the `cli` task). Spec §2 defines
-  `plan` as conflict detection that prints DISJOINT / COLLIDING-SPLITTABLE /
-  INHERENTLY-COUPLED buckets. Today it only parses `tasks.txt` and lists the
-  tasks, touching nothing — its usage text claims no more than that. The real
-  implementation is Stage 3 work (§3.1); until then `plan` is a backlog
-  linter, not a conflict detector.
+- **`plan` writes a run dir holding only `plan.json`** (added with `plan-cmd`,
+  which replaced the placeholder). §2 calls `plan` the dry run that "touches
+  nothing", but the conflict detection it now runs produces `plan.json`, and §2
+  puts `plan.json` in a run dir — so `plan` creates one the normal way and
+  registers no task in it, leaving `.yolotown/latest` pointing at a task-less
+  run until the next `run`. Everything else "touches nothing" means holds: no
+  worktree, no branch, no task agent, no status transition. A refused plan
+  leaves that run dir empty and names the `rm -rf` in its error.
 - **Refactor-gate approval is approve/reject only** (decided 2026-09-11). §3.2
   lists approve / reject / edit; `edit` is deferred. Rejecting and then
   amending `tasks.txt` covers the same need for now.
