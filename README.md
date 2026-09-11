@@ -168,6 +168,63 @@ no tasks registered in it. Because it only reads the index, it answers on a
 dirty tree and off `BASE_BRANCH` too — the states `run` refuses — which is
 exactly when you want to ask.
 
+## The gated refactor (`lib/refactor.sh`) — the one human checkpoint
+
+A `COLLIDING-SPLITTABLE` group is two or more tasks that have to touch the same
+file. They can be made disjoint by splitting that file first — and that split
+mutates the baseline every other task is cut from, so unlike everything else in
+this tool it is **not** automated. It gets exactly one human approval
+(SPEC.md section 3.2), and it is the only place yolotown ever writes to
+`BASE_BRANCH`.
+
+For each such group, one headless call on `PLANNER_MODEL` produces a **plan
+only** — which files split, into what, what moves where, and why that makes the
+colliding tasks disjoint. Nothing is created and nothing is edited to produce
+it. The plan is printed and the gate stops:
+
+```
+yolotown: refactor: group 1/1: alpha + beta
+yolotown: refactor:   shared files: src/shared.js
+yolotown: refactor:   reason:       both tasks rewrite the router
+
+--- refactor plan 1/1: alpha + beta ---
+SPLIT
+  src/shared.js splits into src/shared-alpha.js and src/shared-beta.js.
+MOVES
+  ...
+--- end of plan (.yolotown/latest/refactor/1/plan.txt) ---
+
+This is the one human checkpoint in the pipeline. Nothing has been changed yet.
+  approve  the refactor above runs in its own worktree cut from main, ...
+  reject   nothing is changed at all and the run stops here.
+Empty input or EOF is a reject. "edit" is deferred (SPEC.md section 9) ...
+yolotown: refactor: approve refactor 1/1? [y/N]
+```
+
+**Reject is the default.** Empty input, EOF, or anything that is not an
+explicit yes is a rejection, exactly as `seed.sh` reads its `[y/N]`
+base-branch confirmation — so a piped, cron'd or otherwise non-interactive
+caller gets "no", which is the only safe way to be wrong here. `edit` is
+deferred (SPEC.md section 9) and reads as a rejection that says so.
+
+On approval the refactor runs in its own detached worktree cut from
+`BASE_BRANCH` (`yt-refactor-<n>`), behavior-preserving only, and the **full
+suite** runs there. Only then:
+
+- **green** — `BASE_BRANCH` fast-forwards by **exactly one commit** (the run
+  holds the base, so it cannot have moved; it is checked anyway, and a base
+  that moved is a refusal with the one command that lands the work by hand).
+  The commit body carries the approved plan. It is never pushed: remote base
+  branches stay yours.
+- **red, crashed, or the agent changed nothing** — the worktree is discarded,
+  `BASE_BRANCH` is left byte-identical, and the gate returns nonzero so the
+  caller never fans out on a red baseline. The full output survives in
+  `.yolotown/latest/refactor/<n>/log`.
+
+Each group's plan, decision, reason, log and resulting commit are flat files
+under `.yolotown/latest/refactor/<n>/`; the first rejection or failure stops
+the gate then and there.
+
 ## Lane checking (`lib/lane.sh`) — warn only
 
 Those per-task file predictions are also a *lane*. At gate time — after the
@@ -272,6 +329,7 @@ filesystem origin; the agent is a shim (`tests/fake-claude`) selected via
 - No resumability of interrupted runs.
 - Conflict detection is not wired into `run` yet: `plan` buckets a backlog on
   demand, but `run` still assumes you wrote the tasks so they don't collide.
-  The coupled-group scheduler above is likewise reachable only through
-  `lib/fanout.sh`, because nothing yet hands `run` the buckets to build chains
-  from. The gated refactor stage and that wiring are the rest of Stage 3.
+  The coupled-group scheduler and the refactor gate above are likewise
+  reachable only through `lib/fanout.sh` and `lib/refactor.sh`, because nothing
+  yet hands `run` the buckets to build chains from or the groups to gate. That
+  wiring (`run-wiring`) is the rest of Stage 3.
