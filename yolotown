@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# yolotown entrypoint: subcommand dispatch over the Stage 1 pipeline.
+# yolotown entrypoint: subcommand dispatch over the full pipeline.
 #
 #   plan [tasks.txt]           conflict detection only: bucket the backlog, print
 #                              the buckets and the overlaps; the dry run
-#   run  [opts] [tasks.txt]    dispatch every task into one shared run dir, at most
-#                              MAX_PARALLEL at a time, continuing past individual
-#                              failures, then report
+#   run  [opts] [tasks.txt]    the whole of SPEC.md section 3, end to end, into one
+#                              shared run dir: conflict detection, the gated
+#                              refactor, the bounded fan-out, the gates and the
+#                              fan-in report
 #   run-one <name> "<desc>"    single-task path (delegates to seed.sh verbatim)
 #   status                     per-task report table for the latest run
 #   clean [--force]            print (and with --force execute) worktree/branch removal
@@ -14,6 +15,12 @@
 # replace what used to be a single loud not-implemented stub. `run` fans out
 # through lib/fanout.sh; one worker at a time (MAX_PARALLEL=1, --parallel 1 or
 # --serial) keeps the original inline loop, which streams agent output live.
+#
+# `run` is the only place the Stage 3 pipeline is assembled, and the ORDER is
+# the contract: plan, then the human checkpoint, then — and only then — the
+# first task worktree. Nothing downstream can undo a fan-out that started on a
+# baseline the refactor was still deciding about, so the gate runs to a verdict
+# before a single branch is cut (SPEC.md sections 3.2 and 4).
 set -uo pipefail
 
 YT_PROG=yolotown
@@ -39,6 +46,9 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/plan.sh
 . "$SELF_DIR/lib/plan.sh" \
   || { printf 'yolotown: error: cannot source %s/lib/plan.sh (broken install)\n' "$SELF_DIR" >&2; exit 1; }
+# shellcheck source=lib/refactor.sh
+. "$SELF_DIR/lib/refactor.sh" \
+  || { printf 'yolotown: error: cannot source %s/lib/refactor.sh (broken install)\n' "$SELF_DIR" >&2; exit 1; }
 
 die() { printf 'yolotown: error: %s\n' "$*" >&2; exit 1; }
 
@@ -50,11 +60,18 @@ usage: yolotown <command> [args]
                              COLLIDING-SPLITTABLE / INHERENTLY-COUPLED and print the
                              overlaps behind each. A dry run: no worktree, no branch,
                              no task dispatched; the only thing written is plan.json
-  run [opts] [tasks.txt]     dispatch every task, one run dir, continue past failures,
-                             then print the fan-in report. Options:
+  run [opts] [tasks.txt]     the full pipeline into one run dir: conflict detection,
+                             the gated refactor for every COLLIDING-SPLITTABLE group,
+                             the bounded fan-out (coupled groups run in order), then
+                             the fan-in report. Continues past individual failures.
+                             Options:
                                --parallel N   at most N workers at once (default:
                                               MAX_PARALLEL from .yolotown.conf, 3)
                                --serial       one task at a time, output streamed live
+                               --no-plan      skip conflict detection AND the refactor
+                                              gate; treat every task as DISJOINT. For a
+                                              backlog you wrote to be disjoint and do
+                                              not want to pay a planner call for
   run-one <name> "<desc>"    single-task debugging path (via seed.sh)
   status                     per-task report table for the latest run (.yolotown/latest)
   clean [--force]            print worktree/branch removal commands; execute only with --force
@@ -218,21 +235,69 @@ _yt_run_one() {
   _yt_run_report_task "$name" "$rc"
 }
 
-# cmd_run [--parallel N | --serial] [tasks.txt] — the batch pipeline. Parse the
-# backlog, refuse a dirty or off-base or red baseline up front, create one run
-# dir with every task registered pending, dispatch them at most N at a time
-# (continuing past failures), then render the fan-in report. Exits nonzero if
-# any task failed.
+# _yt_run_abort <reason> <name>... — the pipeline stopped BEFORE dispatch: no
+# task worktree was cut, no task agent was invoked. Every task still pending is
+# retired pending -> skipped with the reason written into its own log (a run is
+# read from its logs), the reason is stated, and the fan-in report is rendered
+# anyway — a run where nothing ran is still a run that has to account for its
+# backlog, and "every task SKIPPED" is exactly what SPEC.md section 3.5 means by
+# SKIPPED (unresolved coupling). Exits 1; never returns.
+_yt_run_abort() {
+  local reason="$1"; shift
+  local name st
+  for name in "$@"; do
+    st="$(yt_status_get "$RUN_DIR" "$name" 2>/dev/null)" || continue
+    [ "$st" = "pending" ] || continue
+    yt_status_set "$RUN_DIR" "$name" skipped >/dev/null 2>&1 || true
+    {
+      printf 'run: task=%s SKIPPED (never dispatched)\n' "$name"
+      printf 'run: skipped: %s\n' "$reason"
+    } >> "$RUN_DIR/logs/$name.log" 2>/dev/null || true
+  done
+
+  printf '\nrun: ABORTED: %s\n' "$reason"
+  printf 'run: nothing was dispatched: no task worktree was cut and no task agent ran.\n'
+  printf 'run: %s is exactly where it was.\n' "$BASE_BRANCH"
+  printf '\n'
+  yt_report "$RUN_DIR" "$BASE_BRANCH" "$BRANCH_PREFIX" "$WORKTREE_PARENT"
+  exit 1
+}
+
+# cmd_run [--parallel N | --serial] [--no-plan] [tasks.txt] — the batch
+# pipeline, which at Stage 3 maturity is the whole of SPEC.md section 3. Parse
+# the backlog, refuse a dirty or off-base or red baseline up front, create one
+# run dir with every task registered pending, then, in this order and no other:
+#
+#   1. conflict detection (lib/plan.sh) -> <run-dir>/plan.json          (3.1)
+#   2. the gated refactor for every COLLIDING-SPLITTABLE group           (3.2)
+#   3. dispatch: DISJOINT tasks fan out, INHERENTLY-COUPLED groups run
+#      in order, each task rebased on the previous (lib/fanout.sh)       (3.3)
+#   4. each task's own gate, commit, push and lane check (lib/task.sh)   (3.4)
+#   5. the fan-in report                                                 (3.5)
+#
+# Steps 1 and 2 happen BEFORE the first worktree exists, which is the whole
+# point of gating a refactor at all: a rejection, or a refactor whose suite went
+# red, aborts the run with nothing dispatched, rather than leaving a fan-out
+# half-cut from a baseline nobody approved. Exits nonzero if any task failed.
+#
+# --no-plan skips 1 and 2 and treats every task as DISJOINT — the Stage 2
+# behavior, for a human who wrote the backlog to be disjoint and does not want
+# to pay for a planner call. It says so loudly in the header: a run with no
+# conflict detection is a run whose collisions are the human's to own, and that
+# has to be visible in the transcript afterwards, not just in the shell history.
 #
 # N comes from MAX_PARALLEL unless --parallel/--serial overrides it. N=1 keeps
 # the inline serial loop rather than fanning out to a single worker: same work,
 # but the agent's output streams to the terminal instead of only to the log,
-# which is what makes --serial useful as the debugging fallback.
+# which is what makes --serial useful as the debugging fallback. A coupled group
+# is a chain, not a lone task, so a backlog carrying one always goes through the
+# chain scheduler — at N=1 that is still strictly one agent at a time.
 cmd_run() {
-  local par_override="" tasks_arg="" have_tasks=0
+  local par_override="" tasks_arg="" have_tasks=0 do_plan=1
   while [ $# -gt 0 ]; do
     case "$1" in
       --serial)     par_override=1; shift ;;
+      --no-plan)    do_plan=0; shift ;;
       --parallel)
         [ $# -ge 2 ] || die "run: --parallel needs a worker count
 example: yolotown run --parallel 4 tasks.txt"
@@ -243,7 +308,7 @@ example: yolotown run --parallel 4 tasks.txt"
 example: yolotown run --parallel 4 tasks.txt"
         shift ;;
       -h|--help)    usage ;;
-      -*)           die "run: unknown option \"$1\" (options: --parallel N, --serial)" ;;
+      -*)           die "run: unknown option \"$1\" (options: --parallel N, --serial, --no-plan)" ;;
       *)
         [ "$have_tasks" -eq 0 ] \
           || die "run takes at most one tasks file (got \"$tasks_arg\" and \"$1\")"
@@ -325,25 +390,119 @@ create it, one task per line: <short-name> | <description>"
     yt_status_init "$RUN_DIR" "${names[$i]}" || die "could not register task \"${names[$i]}\" in $RUN_DIR"
   done
 
-  # Never spin up more workers than there is work for them to do.
-  [ "$parallel" -le "${#names[@]}" ] || parallel="${#names[@]}"
+  # ---- SPEC.md 3.1: conflict detection ---------------------------------------
+  # Into the run dir, because plan.json is this run's state and the lane check
+  # at every gate downstream reads it from exactly there (lib/lane.sh).
+  local plan_file=""
+  if [ "$do_plan" -eq 0 ]; then
+    printf 'run: --no-plan: NO conflict detection and NO refactor gate — every task is treated as DISJOINT and fans out as written; an undetected collision is yours\n'
+  else
+    printf '\nrun: conflict detection over %d task(s) (SPEC.md 3.1)\n' "${#names[@]}"
+    plan_file="$(yt_plan "$RUN_DIR" "$parsed")" || _yt_run_abort \
+      "conflict detection failed (see above); refusing to fan out on a plan that does not exist — a run that guessed \"all disjoint\" would green-light agents overwriting each other. Fix the planner, or re-run with --no-plan to dispatch the backlog exactly as written" \
+      "${names[@]}"
+    printf '\n'
+    yt_plan_print "$plan_file" || die "cannot render the plan at $plan_file"
+
+    # ---- SPEC.md 3.2: the gated refactor stage, the one human checkpoint -----
+    # Before any worktree, deliberately: it may advance BASE_BRANCH, and every
+    # task below is cut from BASE_BRANCH. Its stdin is the human's, so it is
+    # called plainly here — never inside a command substitution.
+    printf '\n'
+    yt_refactor_gate "$RUN_DIR" "$parsed"; rc=$?
+    case "$rc" in
+      0) ;;
+      2) _yt_run_abort \
+           "the refactor was rejected at the gate, so the colliding tasks are still colliding" \
+           "${names[@]}" ;;
+      *) _yt_run_abort \
+           "the refactor stage failed (see above), so the baseline the fan-out would be cut from is not the one that was approved" \
+           "${names[@]}" ;;
+    esac
+  fi
+
+  # ---- SPEC.md 3.3: what gets dispatched as one unit --------------------------
+  # A chain is one dispatch unit: a lone task, or an INHERENTLY-COUPLED group
+  # that runs in order with each task rebased on the previous. Without a plan
+  # every task is its own chain, which is exactly the Stage 2 fan-out.
+  local -a chains=() chain_gid=()
+  local nchains=0 coupled_units=0 gid k idx
+  if [ -n "$plan_file" ]; then
+    local groups
+    groups="$(yt_plan_groups "$plan_file")" \
+      || die "cannot read the dispatch groups from $plan_file"
+    while IFS=$'\t' read -r gid name; do
+      [ -n "$name" ] || continue
+      desc=""
+      i=0
+      while [ "$i" -lt "${#names[@]}" ]; do
+        if [ "${names[$i]}" = "$name" ]; then desc="${descs[$i]}"; break; fi
+        i=$((i + 1))
+      done
+      idx=-1
+      if [ "$gid" != "0" ]; then
+        k=0
+        while [ "$k" -lt "$nchains" ]; do
+          if [ "${chain_gid[$k]}" = "$gid" ]; then idx="$k"; break; fi
+          k=$((k + 1))
+        done
+      fi
+      if [ "$idx" -lt 0 ]; then
+        chains[$nchains]="$(printf '%s\t%s' "$name" "$desc")"
+        # A lone task carries no group id at all: 0 is not a group, it is the
+        # absence of one, and only real groups are ever matched against.
+        if [ "$gid" = "0" ]; then chain_gid[$nchains]=""; else chain_gid[$nchains]="$gid"; fi
+        nchains=$((nchains + 1))
+      else
+        chains[$idx]="${chains[$idx]}
+$(printf '%s\t%s' "$name" "$desc")"
+      fi
+    done <<< "$groups"
+  else
+    i=0
+    while [ "$i" -lt "${#names[@]}" ]; do
+      chains[$nchains]="$(printf '%s\t%s' "${names[$i]}" "${descs[$i]}")"
+      chain_gid[$nchains]=""
+      nchains=$((nchains + 1))
+      i=$((i + 1))
+    done
+  fi
+
+  k=0
+  while [ "$k" -lt "$nchains" ]; do
+    case "${chains[$k]}" in
+      *"
+"*) coupled_units=$((coupled_units + 1)) ;;
+    esac
+    k=$((k + 1))
+  done
+
+  # Never spin up more workers than there is work for them to do. The unit of
+  # work is the chain: a coupled group is ONE worker however many tasks it holds.
+  [ "$parallel" -le "$nchains" ] || parallel="$nchains"
 
   local failures=0
-  if [ "$parallel" -le 1 ]; then
+  if [ "$parallel" -le 1 ] && [ "$coupled_units" -eq 0 ]; then
     echo "run: ${#names[@]} task(s) into $RUN_DIR (serial: one at a time)"
     for i in "${!names[@]}"; do
       printf '\n=== run: task %d/%d: %s\n' "$((i + 1))" "${#names[@]}" "${names[$i]}"
       _yt_run_one "${names[$i]}" "${descs[$i]}" || failures=$((failures + 1))
     done
   else
-    echo "run: ${#names[@]} task(s) into $RUN_DIR (parallel: up to $parallel workers)"
-    echo "run: worker output goes to $RUN_DIR/logs/<task>.log (not the terminal); --serial streams it live"
-    local -a pairs=()
-    for i in "${!names[@]}"; do
-      pairs+=("${names[$i]}" "${descs[$i]}")
-    done
+    if [ "$parallel" -le 1 ]; then
+      echo "run: ${#names[@]} task(s) into $RUN_DIR (serial: one at a time)"
+    else
+      echo "run: ${#names[@]} task(s) into $RUN_DIR (parallel: up to $parallel workers)"
+    fi
+    [ "$coupled_units" -eq 0 ] \
+      || echo "run: $coupled_units INHERENTLY-COUPLED group(s): their tasks run in order, each cut from the previous one's branch"
+    if [ "$parallel" -le 1 ]; then
+      echo "run: worker output goes to $RUN_DIR/logs/<task>.log (not the terminal): a coupled group is dispatched as a chain, which a subshell runs"
+    else
+      echo "run: worker output goes to $RUN_DIR/logs/<task>.log (not the terminal); --serial streams it live"
+    fi
     # 0 = every task passed; the fan-in report below has the per-task detail.
-    yt_fanout "$RUN_DIR" "$parallel" "${pairs[@]}" || failures=1
+    yt_fanout_chains "$RUN_DIR" "$parallel" "${chains[@]}" || failures=1
   fi
 
   printf '\n'

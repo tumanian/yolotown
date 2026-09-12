@@ -126,6 +126,14 @@ for a in "$@"; do
     *"$PROBE_MARKER"*) printf 'probe\n' >> "$PROBE_COUNT_FILE"; echo "ok"; exit 0 ;;
   esac
 done
+# `yolotown run` also makes one conflict-detection call through CLAUDE_BIN.
+# It is not a probe and is not counted as one; the central shim answers it,
+# so this shim keeps counting only what it was written to count.
+for a in "$@"; do
+  case "$a" in
+    *yolotown-conflict-detection-plan*) exec "${FAKE_CLAUDE:?counting shim needs FAKE_CLAUDE}" "$@" ;;
+  esac
+done
 mkdir -p src
 printf '// added by the counting shim\n' > "src/added-$$.js"
 echo "counting shim: made an edit, gate stays green"
