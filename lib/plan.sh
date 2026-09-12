@@ -19,6 +19,7 @@
 #   yt_plan_inventory                  the SOURCE_GLOBS inventory, one path/line
 #   yt_plan_tasks <plan.json>          "<name><TAB><bucket><TAB><files...>"
 #   yt_plan_collisions <plan.json>     "<bucket><TAB><tasks><TAB><files><TAB><reason>"
+#   yt_plan_groups <plan.json>         "<dispatch-group><TAB><name>"
 #   yt_plan_print <plan.json>          the human-readable bucket report
 #
 # The three buckets, one per task:
@@ -427,6 +428,52 @@ yt_plan_collisions() {
   fi
   YT_PLAN_FILE="$f" node -e 'const p=JSON.parse(require("fs").readFileSync(process.env.YT_PLAN_FILE,"utf8"));for(const c of p.collisions)process.stdout.write(c.bucket+"\t"+c.tasks.join(" ")+"\t"+c.files.join(" ")+"\t"+c.reason+"\n")' \
     || { _yt_plan_die "cannot read the plan at $f (not the JSON yt_plan writes)"; return 1; }
+}
+
+# yt_plan_groups <plan.json> — print "<group><TAB><name>" per task, in the
+# plan's (and so the backlog's) order: the DISPATCH shape the plan implies,
+# which is the one thing `run` needs from it beyond the lane predictions.
+#
+#   group 0    dispatch this task on its own. That is every DISJOINT task, and
+#              also every COLLIDING-SPLITTABLE one — by the time anything is
+#              dispatched the refactor gate has either made those tasks disjoint
+#              or stopped the run, so they are never dispatched still colliding.
+#   group N>0  an INHERENTLY-COUPLED chain: every task carrying that number runs
+#              in order, each rebased on the previous (SPEC.md section 3.1). The
+#              number is a dispatch unit, not a bucket name.
+#
+# Two coupled collisions that share a task are ONE chain, not two. A task can
+# only be cut from one predecessor, and dispatching it in two chains would run
+# it twice, racing over exactly the logic the coupled bucket exists to protect.
+# That merge is why this is a reader of its own rather than a loop in the caller.
+yt_plan_groups() {
+  local f="${1:-}"
+  if [ -z "$f" ] || [ ! -f "$f" ]; then
+    _yt_plan_die "no plan file at ${f:-<unset>}"
+    return 1
+  fi
+  YT_PLAN_FILE="$f" node -e '
+const fs = require("fs");
+const p = JSON.parse(fs.readFileSync(process.env.YT_PLAN_FILE, "utf8"));
+const names = p.tasks.map((t) => t.name);
+const g = Object.create(null);
+for (const n of names) g[n] = 0;
+let next = 0;
+for (const c of (p.collisions || [])) {
+  if (c.bucket !== "INHERENTLY-COUPLED") continue;
+  const m = (c.tasks || []).filter((n) => n in g);
+  if (m.length < 2) continue;
+  let id = 0;
+  for (const n of m) if (g[n]) { id = g[n]; break; }
+  if (!id) id = ++next;
+  for (const n of m) {
+    const old = g[n];
+    if (old && old !== id) { for (const k of names) if (g[k] === old) g[k] = id; }
+    else g[n] = id;
+  }
+}
+for (const n of names) process.stdout.write(g[n] + "\t" + n + "\n");
+' || { _yt_plan_die "cannot read the plan at $f (not the JSON yt_plan writes)"; return 1; }
 }
 
 # ---- rendering ---------------------------------------------------------------

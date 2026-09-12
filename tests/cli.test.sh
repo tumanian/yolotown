@@ -102,6 +102,16 @@ SHIM="$TMP_ROOT/pertask-claude"
 cat > "$SHIM" <<'EOF'
 #!/usr/bin/env bash
 set -u
+# The conflict-detection call `yolotown run` makes goes to the central shim,
+# which knows how to answer it; this one only plays a TASK agent. First, before
+# the crash-me check: a planner prompt quotes every task description, so a
+# backlog carrying the word would otherwise crash the planner instead of the
+# task that asked for it.
+for a in "$@"; do
+  case "$a" in
+    *yolotown-conflict-detection-plan*) exec "${FAKE_CLAUDE:?per-task shim needs FAKE_CLAUDE}" "$@" ;;
+  esac
+done
 for a in "$@"; do
   case "$a" in
     *crash-me*) echo "fatal: per-task crash requested" >&2; exit 1 ;;

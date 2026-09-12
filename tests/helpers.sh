@@ -8,6 +8,12 @@ SEED="$YOLOTOWN_ROOT/seed.sh"
 SETUP="$YOLOTOWN_ROOT/setup.sh"
 FAKE_CLAUDE="$YOLOTOWN_ROOT/tests/fake-claude"
 FAKE_GH="$YOLOTOWN_ROOT/tests/fake-gh"
+# Exported so that a test's OWN CLAUDE_BIN shim can hand the calls it does not
+# care about back to the central shim (see the delegation blocks in
+# tests/fan-out.test.sh, tests/cli.test.sh and tests/agent-precheck.test.sh):
+# those shims are written to play a TASK agent, and `yolotown run` also makes a
+# conflict-detection call through the same binary.
+export FAKE_CLAUDE
 
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/yolotown-test.XXXXXX")"
 REPO="$TMP_ROOT/repo"

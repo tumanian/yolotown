@@ -44,6 +44,18 @@ for _a in "$@"; do
   case "$_a" in *yolotown-agent-reachability-probe*) echo "ok"; exit 0 ;; esac
 done
 
+# `yolotown run` also makes a conflict-detection call through CLAUDE_BIN. This
+# shim plays a TASK agent and has nothing to say about a plan, so it hands that
+# call to the central shim, which answers it (FAKE_CLAUDE_PLAN_MODE, default
+# disjoint) — exactly as the reachability probe above is answered rather than
+# measured. Handled here, before the stopwatch below, so a planner call never
+# registers as an agent in flight and can never move the measured peak.
+for _a in "$@"; do
+  case "$_a" in
+    *yolotown-conflict-detection-plan*) exec "${FAKE_CLAUDE:?probe shim needs FAKE_CLAUDE}" "$@" ;;
+  esac
+done
+
 DIR="${PROBE_DIR:?probe shim needs PROBE_DIR}"
 mkdir -p "$DIR/inflight"
 ME="$DIR/inflight/$$"

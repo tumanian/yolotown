@@ -7,10 +7,11 @@ agents in isolated git worktrees, each gated by the target repo's own tests.
 Green branches get committed and optionally pushed. The tool's contract ends
 at "green branch exists" — it never merges to your base branch.
 
-**Current state: Stage 1 (self-build).** `seed.sh` still runs exactly one task
-through one agent in one worktree; the `yolotown` entrypoint wraps that core in
-a backlog pipeline that fans tasks out to bounded parallel workers. What's left
-of the roadmap (conflict detection and the gated refactor stage) is built *by*
+**Current state: Stage 3 (the full pipeline).** `seed.sh` still runs exactly one
+task through one agent in one worktree; the `yolotown` entrypoint wraps that
+core in the whole of SPEC.md section 3 — conflict detection, the gated refactor,
+the bounded fan-out with coupled groups run in order, each task's own gate and
+lane check, and the fan-in report. Every part of it after the seed was built *by*
 the tool, task by task, gated by this repo's own test suite. See
 [DESIGN.md](DESIGN.md) for the approved seed design and [SPEC.md](SPEC.md) for
 the whole plan.
@@ -63,16 +64,45 @@ Write the tasks one per line in `tasks.txt` as `<short-name> | <description>`
 
 ```sh
 /path/to/yolotown/yolotown plan            # conflict detection only; dispatches nothing
-/path/to/yolotown/yolotown run             # dispatch the backlog
+/path/to/yolotown/yolotown run             # the full pipeline: plan, gate, fan out, report
 /path/to/yolotown/yolotown status          # the latest run's table again
 /path/to/yolotown/yolotown clean --force   # remove the leftover worktrees
 ```
 
 `run` checks the base once (clean, on `BASE_BRANCH`, green suite, agent
-reachable), then gives each task its own worktree, branch, log and gate. A
-failed task dies alone: the run continues, and the fan-in report at the end
+reachable), then executes the whole pipeline into one run dir, in this order:
+
+1. **Conflict detection** — one planner call buckets the backlog into
+   `<run-dir>/plan.json` (below).
+2. **The refactor gate** — every `COLLIDING-SPLITTABLE` group is planned,
+   printed, and **stopped on for your approval**. This is the one place the run
+   waits for a human, and the one place it writes to `BASE_BRANCH`.
+3. **Fan-out** — disjoint tasks run in parallel, each in its own worktree and
+   branch cut from the (possibly refactored) base; `INHERENTLY-COUPLED` groups
+   run in order instead, each task rebased on the previous one.
+4. **Gate and ship, per task** — `TEST_CMD` in the worktree, then commit, push,
+   and the lane check.
+5. **The fan-in report.**
+
+Steps 1 and 2 finish *before the first worktree is cut*. A rejected refactor, a
+refactor whose suite went red, or a planner that could not answer stops the run
+right there: nothing is dispatched, `BASE_BRANCH` is exactly where it was, and
+every task is reported `SKIPPED` with the reason in its own log. Once tasks are
+dispatched, a failed task dies alone: the run continues, and the fan-in report
 lists every task with its log, its worktree, and a ready-to-run merge command
 for each green branch.
+
+Skip the first two steps with `--no-plan`:
+
+```sh
+yolotown run --no-plan tasks.txt   # no planner call, no gate; every task is DISJOINT
+```
+
+That is the Stage 2 behavior, for a backlog you wrote to be disjoint and don't
+want to pay a planner call for. It announces itself loudly in the run header,
+because a run with no conflict detection is a run whose collisions are yours,
+and that has to be visible in the transcript afterwards. `run-one` never plans
+either: a single task has nothing to collide with.
 
 Tasks run **at most `MAX_PARALLEL` at a time** (default 3, because rate limits
 are real). A freed slot is refilled immediately, so N workers stay busy until
@@ -223,7 +253,8 @@ suite** runs there. Only then:
 
 Each group's plan, decision, reason, log and resulting commit are flat files
 under `.yolotown/latest/refactor/<n>/`; the first rejection or failure stops
-the gate then and there.
+the gate then and there — and stops the `run` with it, before a single task
+worktree exists.
 
 ## Lane checking (`lib/lane.sh`) — warn only
 
@@ -251,9 +282,10 @@ branch, not a gate. Whether lane violations ever become blocking is a decision
 deliberately deferred (SPEC.md section 7), so the check has no path that can
 fail a task even by accident.
 
-**No prediction is not a violation.** `yolotown run-one` never runs conflict
-detection, so its run dir has no `plan.json` and there is nothing to compare
-against; the same goes for a task a plan simply doesn't name. Those are
+**No prediction is not a violation.** `yolotown run-one`, and any `run
+--no-plan`, never runs conflict detection, so the run dir has no `plan.json` and
+there is nothing to compare against; the same goes for a task a plan simply
+doesn't name. Those are
 *unchecked*, which is silent — no warning file, no `warnings/` directory, one
 line in the log saying why. Warning there would mean warning on every
 single-task run.
@@ -298,6 +330,13 @@ means agents in flight. Groups fan out against *each other* and against lone
 tasks; only the inside of a group is serial. A group's failure is contained to
 that group, exactly as a single task's failure is contained to that task.
 
+`run` builds the chains itself from `plan.json`: every `INHERENTLY-COUPLED`
+collision becomes one chain, every other task its own. Two coupled collisions
+that share a task are **one** chain, not two — a task can only be cut from one
+predecessor, and dispatching it twice would race it against itself over exactly
+the logic the bucket exists to protect. `COLLIDING-SPLITTABLE` tasks are lone
+tasks by then: the gate above has either made them disjoint or stopped the run.
+
 ## Testing
 
 ```sh
@@ -327,9 +366,9 @@ filesystem origin; the agent is a shim (`tests/fake-claude`) selected via
   hangs (Ctrl-C is safe; worktrees are never auto-deleted once an agent has
   run).
 - No resumability of interrupted runs.
-- Conflict detection is not wired into `run` yet: `plan` buckets a backlog on
-  demand, but `run` still assumes you wrote the tasks so they don't collide.
-  The coupled-group scheduler and the refactor gate above are likewise
-  reachable only through `lib/fanout.sh` and `lib/refactor.sh`, because nothing
-  yet hands `run` the buckets to build chains from or the groups to gate. That
-  wiring (`run-wiring`) is the rest of Stage 3.
+- `run` waits for a human at the refactor gate, so a backlog with a
+  `COLLIDING-SPLITTABLE` group cannot be run unattended: with stdin closed the
+  gate reads EOF as a rejection and the run stops having dispatched nothing.
+  Plan first (`yolotown plan`) if you need to know whether a run will stop.
+- The refactor gate takes `approve` / `reject` only; `edit` is deferred
+  (SPEC.md section 9). Reject, amend the backlog, re-run.
