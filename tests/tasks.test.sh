@@ -200,7 +200,7 @@ EOF
 # It is expected to need updating when a stage's backlog turns over — that edit
 # is the point, because it forces a human to look at an emptied backlog rather
 # than let the suite stay green through it.
-assert_contains "$PARSE_OUT" "refactor-edit${TAB}" "repo tasks.txt still carries its final task"
+assert_contains "$PARSE_OUT" "status-heartbeat${TAB}" "repo tasks.txt still carries its final task"
 ok "repo tasks.txt is well-formed"
 
 echo "tasks: all cases passed"
